@@ -25,6 +25,8 @@ export interface RequestView {
   priority: RequestWithRelations['priority'];
   source: RequestWithRelations['source'];
   note: string | null;
+  /** Quantité demandée (ex. 2 bouteilles d'eau), sinon null. */
+  quantity: number | null;
   table: { id: string; label: string };
   area: { id: string; name: string };
   type: { id: string; label: string; icon: string; kind: 'service' | 'order' };
@@ -54,6 +56,7 @@ export function toRequestView(request: RequestWithRelations): RequestView {
     priority: request.priority,
     source: request.source,
     note: request.note,
+    quantity: request.quantity,
     table: request.table,
     area: request.area,
     type: request.requestType,
@@ -83,6 +86,7 @@ export interface GuestRequestView {
   type: { id: string; label: string; icon: string; kind: 'service' | 'order' };
   items: OrderLineView[];
   totalMinor: number | null;
+  quantity: number | null;
   handledBy: string | null;
   createdAt: string;
   acceptedAt: string | null;
@@ -99,6 +103,7 @@ export function toGuestRequestView(request: RequestWithRelations): GuestRequestV
     type: request.requestType,
     items: request.items,
     totalMinor: request.totalMinor,
+    quantity: request.quantity,
     handledBy: handled && request.assignee ? request.assignee.firstName : null,
     createdAt: request.createdAt.toISOString(),
     acceptedAt: iso(request.acceptedAt),

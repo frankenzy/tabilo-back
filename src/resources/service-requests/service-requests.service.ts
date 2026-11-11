@@ -56,7 +56,7 @@ export interface OrderLineInput {
 
 /** Ce qu'un client peut créer : une demande de service, ou une commande depuis la carte. */
 export type GuestCreateInput =
-  | { kind: 'service'; requestTypeId: string; note?: string }
+  | { kind: 'service'; requestTypeId: string; note?: string; quantity?: number }
   | { kind: 'order'; items: OrderLineInput[]; note?: string };
 
 interface ResolvedLine {
@@ -254,6 +254,7 @@ export class ServiceRequestsService {
         table,
         type,
         note: type.allowNote ? input.note : undefined,
+        quantity: input.kind === 'service' ? input.quantity : undefined,
         lines,
         source: 'customer',
         actor: { type: 'customer', id: null },
@@ -600,6 +601,7 @@ export class ServiceRequestsService {
       table: { id: string; areaId: string };
       type: { id: string; priority: ServiceRequest['priority']; slaSeconds: number };
       note?: string;
+      quantity?: number;
       lines?: ResolvedLine[];
       source: ServiceRequest['source'];
       actor: Actor;
@@ -619,6 +621,7 @@ export class ServiceRequestsService {
         sessionId: input.sessionId,
         source: input.source,
         note: input.note ? input.note : null,
+        quantity: input.quantity ?? null,
         priority: input.type.priority,
         createdById: input.actor.id,
         idempotencyKey: input.idempotencyKey,

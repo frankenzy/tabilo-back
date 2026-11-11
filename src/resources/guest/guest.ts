@@ -41,6 +41,10 @@ export class GuestCreateRequestDto {
   @ApiPropertyOptional({ maxLength: NOTE_MAX_LENGTH })
   @IsOptional() @Transform(trim) @IsString() @MaxLength(NOTE_MAX_LENGTH)
   note?: string;
+
+  @ApiPropertyOptional({ minimum: 1, maximum: 10, description: "Quantité demandée (ex. bouteilles d'eau)" })
+  @IsOptional() @IsInt() @Min(1) @Max(10)
+  quantity?: number;
 }
 
 export class OrderLineDto {

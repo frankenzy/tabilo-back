@@ -591,6 +591,25 @@ describe('Spec 001 — carte et commandes', () => {
     });
   });
 
+  // ------------------------------------------------------------------ eau
+
+  describe('Spec 005 — demande d’eau avec quantité', () => {
+    it('CA-005-06 — la quantité est enregistrée, visible du personnel et du client, bornée de 1 à 10', async () => {
+      const guest = await openSession(t, (await createTable(t, owner)).code);
+      const types = (await t.http.get('/api/v1/guest/session').set(guest.headers).expect(200)).body.requestTypes as { id: string; icon: string }[];
+      const water = types.find((type) => type.icon === 'droplet')!;
+      await t.http.post('/api/v1/guest/requests').set(guest.headers).send({ requestTypeId: water.id, quantity: 11 }).expect(400);
+      await t.http.post('/api/v1/guest/requests').set(guest.headers).send({ requestTypeId: water.id, quantity: 0 }).expect(400);
+      const created = await t.http.post('/api/v1/guest/requests').set(guest.headers).send({ requestTypeId: water.id, quantity: 2 }).expect(200);
+      expect(created.body.request.quantity).toBe(2);
+      const staff = await t.http.get(`${owner.base}/requests/${created.body.request.id}`).set(owner.auth).expect(200);
+      expect(staff.body.quantity).toBe(2);
+      // Sans quantité, une demande de service reste sans quantité.
+      const call = await t.http.post('/api/v1/guest/requests').set(guest.headers).send({ requestTypeId: types[0].id }).expect(200);
+      expect(call.body.request.quantity).toBeNull();
+    });
+  });
+
   // ------------------------------------------------------------ statistiques
 
   describe('Statistiques de ventes', () => {

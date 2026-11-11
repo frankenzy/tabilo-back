@@ -333,6 +333,8 @@ model ServiceRequest {
   sessionId        String?          @db.Uuid
   source           RequestSource
   note             String?
+  /// Quantité demandée pour une demande de service (ex. 2 bouteilles d'eau, spec 005). NULL = non précisée.
+  quantity         Int?
   priority         RequestPriority  @default(normal)
   status           RequestStatus    @default(pending)
   escalationStatus EscalationStatus @default(none)
