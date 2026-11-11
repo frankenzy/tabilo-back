@@ -1,0 +1,469 @@
+// TABILO — modèle relationnel.
+// Règles transverses :
+//  - toute donnée métier porte tenantId (+ establishmentId quand elle appartient à un établissement) ;
+//  - les horodatages sont en UTC (timestamptz), présentés dans le fuseau de l'établissement ;
+//  - pas de suppression physique des données traçables : deletedAt (archivage) ou onDelete: Restrict ;
+//  - clés étrangères composites (id, establishmentId) là où un rattachement croisé entre
+//    établissements serait une fuite inter-tenant.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TenantStatus {
+  active
+  suspended
+}
+
+enum UserStatus {
+  active
+  disabled
+}
+
+enum QrStatus {
+  active
+  revoked
+}
+
+enum SessionStatus {
+  open
+  closed
+  expired
+}
+
+enum RequestStatus {
+  pending
+  assigned
+  accepted
+  in_progress
+  resolved
+  cancelled
+}
+
+enum EscalationStatus {
+  none
+  escalated
+  acknowledged
+}
+
+enum RequestPriority {
+  normal
+  high
+}
+
+enum RequestSource {
+  customer
+  staff
+}
+
+enum ActorType {
+  customer
+  staff
+  system
+}
+
+enum EscalationTrigger {
+  not_accepted
+  not_resolved
+}
+
+/// Client de la plateforme (société exploitante). Racine de l'isolation des données.
+model Tenant {
+  id        String       @id @default(uuid()) @db.Uuid
+  name      String
+  status    TenantStatus @default(active)
+  createdAt DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime     @updatedAt @db.Timestamptz(3)
+
+  establishments Establishment[]
+  users          User[]
+  roles          Role[]
+}
+
+/// Point de vente (restaurant, café, glacier). Porte le paramétrage opérationnel.
+model Establishment {
+  id        String    @id @default(uuid()) @db.Uuid
+  tenantId  String    @db.Uuid
+  name      String
+  timezone  String    @default("Africa/Abidjan")
+  address   String?
+  phone     String?
+  /// Durée de validité d'une session de table après un scan.
+  sessionTtlMinutes         Int @default(180)
+  /// Nombre maximal de demandes non terminées par table.
+  maxActiveRequestsPerTable Int @default(5)
+  /// Nombre maximal de demandes créées par une même session.
+  maxRequestsPerSession     Int @default(30)
+  /// Délai minimal entre deux demandes d'une même session.
+  requestCooldownSeconds    Int @default(10)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  archivedAt DateTime? @db.Timestamptz(3)
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  memberships     Membership[]
+  areas           DiningArea[]
+  tables          DiningTable[]
+  qrCodes         QrCode[]
+  sessions        TableSession[]
+  requestTypes    RequestType[]
+  requests        ServiceRequest[]
+  escalationRules EscalationRule[]
+
+  @@index([tenantId])
+}
+
+/// Compte du personnel. Un utilisateur appartient à un seul tenant.
+model User {
+  id                 String     @id @default(uuid()) @db.Uuid
+  tenantId           String     @db.Uuid
+  email              String     @unique
+  passwordHash       String
+  firstName          String
+  lastName           String
+  status             UserStatus @default(active)
+  mustChangePassword Boolean    @default(false)
+  failedLoginCount   Int        @default(0)
+  lockedUntil        DateTime?  @db.Timestamptz(3)
+  lastLoginAt        DateTime?  @db.Timestamptz(3)
+  createdAt          DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime   @updatedAt @db.Timestamptz(3)
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  memberships     Membership[]
+  refreshSessions RefreshSession[]
+  notifications   Notification[]
+  assignedRequests ServiceRequest[] @relation("RequestAssignee")
+
+  @@index([tenantId])
+}
+
+/// Rôle. tenantId NULL = rôle système (owner, manager, waiter), non modifiable.
+/// Les permissions sont des clés du catalogue versionné dans le code (commons/constants/permissions).
+model Role {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String?  @db.Uuid
+  key         String
+  name        String
+  isSystem    Boolean  @default(false)
+  permissions String[]
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  tenant      Tenant?      @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  memberships Membership[]
+
+  @@unique([tenantId, key])
+  @@index([tenantId])
+}
+
+/// Périmètre d'accès explicite : un utilisateur, un établissement, un rôle.
+model Membership {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  userId          String   @db.Uuid
+  establishmentId String   @db.Uuid
+  roleId          String   @db.Uuid
+  createdAt       DateTime @default(now()) @db.Timestamptz(3)
+
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  establishment Establishment @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  role          Role          @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, establishmentId])
+  @@index([establishmentId])
+}
+
+/// Session d'authentification (refresh token haché, rotation par famille).
+model RefreshSession {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  familyId   String    @db.Uuid
+  tokenHash  String    @unique
+  userAgent  String?
+  ip         String?
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+  expiresAt  DateTime  @db.Timestamptz(3)
+  revokedAt  DateTime? @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+}
+
+/// Zone de salle (terrasse, étage…).
+model DiningArea {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @db.Uuid
+  establishmentId String    @db.Uuid
+  name            String
+  position        Int       @default(0)
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @db.Timestamptz(3)
+  archivedAt      DateTime? @db.Timestamptz(3)
+
+  establishment Establishment    @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  tables        DiningTable[]
+  requests      ServiceRequest[]
+
+  @@unique([id, establishmentId])
+  @@index([establishmentId, archivedAt])
+}
+
+/// Table physique. Le libellé est unique parmi les tables actives d'un établissement
+/// (index unique partiel créé dans la migration).
+model DiningTable {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @db.Uuid
+  establishmentId String    @db.Uuid
+  areaId          String    @db.Uuid
+  label           String
+  seats           Int       @default(2)
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @db.Timestamptz(3)
+  archivedAt      DateTime? @db.Timestamptz(3)
+
+  establishment Establishment    @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  area          DiningArea       @relation(fields: [areaId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
+  qrCodes       QrCode[]
+  sessions      TableSession[]
+  requests      ServiceRequest[]
+
+  @@unique([id, establishmentId])
+  @@index([establishmentId, archivedAt])
+  @@index([areaId])
+}
+
+/// QR code permanent d'une table. `code` est un identifiant public imprimé (pas un secret) :
+/// il ne donne accès à rien sans ouverture de session, et se révoque.
+model QrCode {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @db.Uuid
+  establishmentId String    @db.Uuid
+  tableId         String    @db.Uuid
+  code            String    @unique
+  status          QrStatus  @default(active)
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+  revokedAt       DateTime? @db.Timestamptz(3)
+
+  establishment Establishment  @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  table         DiningTable    @relation(fields: [tableId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
+  sessions      TableSession[]
+
+  @@index([tableId, status])
+}
+
+/// Session de table ouverte par un scan. Le jeton n'est stocké que haché (SHA-256).
+model TableSession {
+  id              String        @id @default(uuid()) @db.Uuid
+  tenantId        String        @db.Uuid
+  establishmentId String        @db.Uuid
+  tableId         String        @db.Uuid
+  qrCodeId        String        @db.Uuid
+  tokenHash       String        @unique
+  status          SessionStatus @default(open)
+  requestCount    Int           @default(0)
+  lastRequestAt   DateTime?     @db.Timestamptz(3)
+  openedAt        DateTime      @default(now()) @db.Timestamptz(3)
+  expiresAt       DateTime      @db.Timestamptz(3)
+  closedAt        DateTime?     @db.Timestamptz(3)
+  closedById      String?       @db.Uuid
+
+  establishment Establishment    @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  table         DiningTable      @relation(fields: [tableId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
+  qrCode        QrCode           @relation(fields: [qrCodeId], references: [id], onDelete: Restrict)
+  requests      ServiceRequest[]
+
+  @@index([tableId, status])
+  @@index([status, expiresAt])
+}
+
+/// Type de demande configurable par établissement.
+model RequestType {
+  id              String          @id @default(uuid()) @db.Uuid
+  tenantId        String          @db.Uuid
+  establishmentId String          @db.Uuid
+  label           String
+  icon            String          @default("bell")
+  priority        RequestPriority @default(normal)
+  /// Délai cible de prise en charge (acceptation), en secondes. Au-delà, la demande est « en retard ».
+  slaSeconds      Int             @default(180)
+  allowNote       Boolean         @default(true)
+  isActive        Boolean         @default(true)
+  position        Int             @default(0)
+  createdAt       DateTime        @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime        @updatedAt @db.Timestamptz(3)
+  archivedAt      DateTime?       @db.Timestamptz(3)
+
+  establishment   Establishment    @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  requests        ServiceRequest[]
+  escalationRules EscalationRule[]
+
+  @@unique([id, establishmentId])
+  @@index([establishmentId, archivedAt])
+}
+
+/// Demande de service. Les horodatages d'étape sont écrits dans la même transaction
+/// que l'événement correspondant : ils servent de base aux indicateurs.
+model ServiceRequest {
+  id               String           @id @default(uuid()) @db.Uuid
+  tenantId         String           @db.Uuid
+  establishmentId  String           @db.Uuid
+  tableId          String           @db.Uuid
+  areaId           String           @db.Uuid
+  requestTypeId    String           @db.Uuid
+  sessionId        String?          @db.Uuid
+  source           RequestSource
+  note             String?
+  priority         RequestPriority  @default(normal)
+  status           RequestStatus    @default(pending)
+  escalationStatus EscalationStatus @default(none)
+  assigneeId       String?          @db.Uuid
+  createdById      String?          @db.Uuid
+  idempotencyKey   String?
+  /// Verrou optimiste : incrémenté à chaque transition.
+  version          Int              @default(0)
+  createdAt        DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime         @updatedAt @db.Timestamptz(3)
+  dueAt            DateTime         @db.Timestamptz(3)
+  assignedAt       DateTime?        @db.Timestamptz(3)
+  acceptedAt       DateTime?        @db.Timestamptz(3)
+  startedAt        DateTime?        @db.Timestamptz(3)
+  resolvedAt       DateTime?        @db.Timestamptz(3)
+  cancelledAt      DateTime?        @db.Timestamptz(3)
+  escalatedAt      DateTime?        @db.Timestamptz(3)
+
+  establishment Establishment       @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  table         DiningTable         @relation(fields: [tableId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
+  requestType   RequestType         @relation(fields: [requestTypeId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
+  area          DiningArea          @relation(fields: [areaId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
+  session       TableSession?       @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  assignee      User?               @relation("RequestAssignee", fields: [assigneeId], references: [id], onDelete: Restrict)
+  assignments   ServiceAssignment[]
+  events        ServiceRequestEvent[]
+
+  @@unique([establishmentId, idempotencyKey])
+  @@index([establishmentId, status, createdAt])
+  @@index([establishmentId, createdAt])
+  @@index([assigneeId, status])
+  @@index([tableId, status])
+  @@index([sessionId])
+}
+
+/// Historique des affectations d'une demande (qui, par qui, pourquoi, jusqu'à quand).
+model ServiceAssignment {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @db.Uuid
+  establishmentId String    @db.Uuid
+  requestId       String    @db.Uuid
+  assigneeId      String    @db.Uuid
+  assignedById    String?   @db.Uuid
+  reason          String?
+  assignedAt      DateTime  @default(now()) @db.Timestamptz(3)
+  endedAt         DateTime? @db.Timestamptz(3)
+
+  request ServiceRequest @relation(fields: [requestId], references: [id], onDelete: Restrict)
+
+  @@index([requestId])
+  @@index([assigneeId, assignedAt])
+}
+
+/// Journal append-only des événements métier d'une demande. Jamais modifié ni supprimé.
+model ServiceRequestEvent {
+  id              String         @id @default(uuid()) @db.Uuid
+  tenantId        String         @db.Uuid
+  establishmentId String         @db.Uuid
+  requestId       String         @db.Uuid
+  type            String
+  fromStatus      RequestStatus?
+  toStatus        RequestStatus?
+  actorType       ActorType
+  actorId         String?        @db.Uuid
+  payload         Json?
+  createdAt       DateTime       @default(now()) @db.Timestamptz(3)
+
+  request ServiceRequest @relation(fields: [requestId], references: [id], onDelete: Restrict)
+
+  @@index([requestId, createdAt])
+  @@index([establishmentId, createdAt])
+}
+
+/// Règle d'escalade : déclenche une alerte de supervision après un délai.
+model EscalationRule {
+  id              String            @id @default(uuid()) @db.Uuid
+  tenantId        String            @db.Uuid
+  establishmentId String            @db.Uuid
+  name            String
+  trigger         EscalationTrigger
+  afterSeconds    Int
+  /// NULL = tous les types de demande.
+  requestTypeId   String?           @db.Uuid
+  isActive        Boolean           @default(true)
+  createdAt       DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime          @updatedAt @db.Timestamptz(3)
+  archivedAt      DateTime?         @db.Timestamptz(3)
+
+  establishment Establishment @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  requestType   RequestType?  @relation(fields: [requestTypeId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
+
+  @@index([establishmentId, isActive])
+}
+
+/// Notification persistée destinée à un membre du personnel.
+model Notification {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @db.Uuid
+  establishmentId String    @db.Uuid
+  userId          String    @db.Uuid
+  type            String
+  title           String
+  body            String?
+  requestId       String?   @db.Uuid
+  /// Identifiant de l'événement d'origine : garantit l'absence de doublon en cas de rejeu.
+  sourceEventId   BigInt?
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+  readAt          DateTime? @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, sourceEventId])
+  @@index([userId, establishmentId, readAt, createdAt])
+}
+
+/// Journal d'audit (administration et sécurité). Append-only.
+model AuditLog {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String?  @db.Uuid
+  establishmentId String?  @db.Uuid
+  actorId         String?  @db.Uuid
+  action          String
+  entityType      String?
+  entityId        String?
+  metadata        Json?
+  ip              String?
+  createdAt       DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([tenantId, establishmentId, createdAt])
+  @@index([actorId, createdAt])
+}
+
+/// Transactional outbox : écrit dans la transaction métier, diffusé après validation.
+model OutboxEvent {
+  id              BigInt    @id @default(autoincrement())
+  tenantId        String    @db.Uuid
+  establishmentId String    @db.Uuid
+  type            String
+  payload         Json
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+  publishedAt     DateTime? @db.Timestamptz(3)
+  attempts        Int       @default(0)
+
+  @@index([publishedAt, id])
+  @@index([establishmentId, id])
+}
