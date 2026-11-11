@@ -32,7 +32,7 @@ export async function createApp(): Promise<{ app: NestFastifyApplication; env: A
   app.enableCors({
     origin: env.corsOrigins,
     credentials: true,
-    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], // PUT : ordre de la carte et photos (spec 001)
     allowedHeaders: ['content-type', 'authorization', 'x-table-session', 'idempotency-key'],
     maxAge: 600,
   });

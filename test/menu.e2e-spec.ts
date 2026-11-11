@@ -136,6 +136,16 @@ describe('Spec 001 — carte et commandes', () => {
       expect(await t.prisma.auditLog.count({ where: { action: 'menu_item.image_removed', entityId: dish } })).toBe(1);
     });
 
+    it('CA-001-07 et CA-001-27 — le navigateur est autorisé à envoyer un PUT (photo, ordre) depuis le frontend', async () => {
+      const preflight = await t.http
+        .options(`${menu(owner)}/categories/order`)
+        .set('Origin', 'http://localhost:3004')
+        .set('Access-Control-Request-Method', 'PUT')
+        .set('Access-Control-Request-Headers', 'authorization,content-type');
+      expect(preflight.status).toBeLessThan(300);
+      expect(preflight.headers['access-control-allow-methods']).toContain('PUT');
+    });
+
     it('CA-001-08 — refuse une photo trop lourde, un faux JPEG ou un format non pris en charge', async () => {
       const rubric = await category(owner, 'Photos refusées');
       const dish = await item(owner, rubric, 'Foutou', 3000);
