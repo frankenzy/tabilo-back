@@ -207,6 +207,61 @@ export class MenuService {
     return category;
   }
 
+  /**
+   * Suggestions « Souvent commandés avec » (spec 002, R1) : 6 articles au plus, jamais un article
+   * du panier, épuisé ou retiré. Trois passes : co-occurrence dans les commandes servies des
+   * 90 derniers jours, puis popularité, puis articles des rubriques absentes du panier.
+   */
+  async suggestions(establishmentId: string, cartIds: string[]): Promise<string[]> {
+    const LIMIT = 6;
+    const since = new Date(Date.now() - 90 * 86_400_000);
+    const cart = [...new Set(cartIds)];
+    const orderable = await this.prisma.menuItem.findMany({
+      where: { establishmentId, archivedAt: null, isAvailable: true, category: { archivedAt: null } },
+      orderBy: [{ category: { position: 'asc' } }, { position: 'asc' }, { createdAt: 'asc' }],
+      select: { id: true, categoryId: true },
+    });
+    const candidates = new Set(orderable.map((item) => item.id));
+    cart.forEach((id) => candidates.delete(id));
+    const picked: string[] = [];
+    const take = (ids: string[]) => {
+      for (const id of ids) {
+        if (picked.length >= LIMIT) return;
+        if (candidates.has(id) && !picked.includes(id)) picked.push(id);
+      }
+    };
+
+    if (cart.length > 0) {
+      const together = await this.prisma.$queryRaw<{ id: string }[]>`
+        SELECT o."menuItemId"::text AS id
+        FROM "ServiceRequestItem" a
+        JOIN "ServiceRequestItem" o ON o."requestId" = a."requestId" AND o."menuItemId" <> a."menuItemId"
+        JOIN "ServiceRequest" r ON r.id = a."requestId"
+        WHERE a."establishmentId" = ${establishmentId}::uuid
+          AND a."menuItemId" = ANY(${cart}::uuid[])
+          AND r.status = 'resolved' AND r."createdAt" >= ${since}
+        GROUP BY o."menuItemId"
+        ORDER BY count(DISTINCT o."requestId") DESC, o."menuItemId"
+        LIMIT 50`;
+      take(together.map((row) => row.id));
+    }
+    if (picked.length < LIMIT) {
+      const popular = await this.prisma.$queryRaw<{ id: string }[]>`
+        SELECT i."menuItemId"::text AS id
+        FROM "ServiceRequestItem" i JOIN "ServiceRequest" r ON r.id = i."requestId"
+        WHERE i."establishmentId" = ${establishmentId}::uuid AND r.status = 'resolved' AND r."createdAt" >= ${since}
+        GROUP BY i."menuItemId"
+        ORDER BY sum(i.quantity) DESC, i."menuItemId"
+        LIMIT 50`;
+      take(popular.map((row) => row.id));
+    }
+    if (picked.length < LIMIT) {
+      const cartCategories = new Set(orderable.filter((item) => cart.includes(item.id)).map((item) => item.categoryId));
+      take(orderable.filter((item) => !cartCategories.has(item.categoryId)).map((item) => item.id));
+    }
+    return picked;
+  }
+
   /** Lecture publique d'une photo par son identifiant. */
   async image(id: string): Promise<{ mime: string; data: Buffer }> {
     const image = await this.prisma.menuImage.findUnique({ where: { id }, select: { mime: true, data: true } });

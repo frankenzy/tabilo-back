@@ -1,5 +1,5 @@
 import {
-  Body, Controller, Get, Headers, HttpCode, Injectable, Module, Param, ParseUUIDPipe, Post, Res, UseGuards,
+  Body, Controller, Get, Headers, HttpCode, Injectable, Module, Param, ParseUUIDPipe, Post, Query, Res, UseGuards,
 } from '@nestjs/common';
 import type { FastifyReply } from 'fastify';
 import { ApiHeader, ApiOperation, ApiProperty, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
@@ -59,6 +59,16 @@ export class GuestCreateOrderDto {
   @ApiPropertyOptional({ maxLength: NOTE_MAX_LENGTH })
   @IsOptional() @Transform(trim) @IsString() @MaxLength(NOTE_MAX_LENGTH)
   note?: string;
+}
+
+export class SuggestionsQueryDto {
+  @ApiPropertyOptional({ description: "Identifiants des articles de la commande, séparés par des virgules (30 au plus)" })
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.split(',').map((id) => id.trim()).filter(Boolean) : value,
+  )
+  @IsArray() @ArrayMaxSize(30) @IsUUID('all', { each: true })
+  items?: string[];
 }
 
 @Injectable()
@@ -183,6 +193,14 @@ export class GuestController {
     return this.requests.createByGuest(guest, { kind: 'service', ...dto }, this.key(idempotencyKey));
   }
 
+  @Get('suggestions')
+  @UseGuards(GuestSessionGuard)
+  @ApiHeader({ name: SESSION_HEADER, required: true })
+  @ApiOperation({ summary: 'Articles souvent commandés avec ceux de la commande (6 au plus)' })
+  async suggestions(@CurrentGuest() guest: GuestSession, @Query() query: SuggestionsQueryDto) {
+    return { menuItemIds: await this.menu.suggestions(guest.establishmentId, query.items ?? []) };
+  }
+
   @Post('orders')
   @HttpCode(200)
   @UseGuards(GuestSessionGuard)
@@ -206,6 +224,8 @@ export class GuestController {
     void reply
       .header('content-type', image.mime)
       .header('cache-control', 'public, max-age=31536000, immutable')
+      // Photo publique, affichée par le frontend depuis une autre origine (helmet pose same-site par défaut).
+      .header('cross-origin-resource-policy', 'cross-origin')
       .send(image.data);
   }
 

@@ -130,6 +130,7 @@ describe('Spec 001 — carte et commandes', () => {
       expect(image.headers['content-type']).toBe('image/jpeg');
       expect(image.headers['cache-control']).toContain('immutable');
       expect(image.headers['x-content-type-options']).toBe('nosniff');
+      expect(image.headers['cross-origin-resource-policy']).toBe('cross-origin');
 
       await t.http.delete(`${menu(owner)}/items/${dish}/image`).set(owner.auth).expect(200);
       expect(await t.prisma.menuImage.findUnique({ where: { id: second.body.imageId } })).toBeNull();
@@ -477,6 +478,76 @@ describe('Spec 001 — carte et commandes', () => {
       expect(await count(fresh.establishmentId)).toBe(1);
       const second = await t.http.post('/api/v1/establishments').set(fresh.auth).send({ name: 'Nouveau maquis 2' }).expect(201);
       expect(await count(second.body.id)).toBe(1);
+    });
+  });
+
+  // ------------------------------------------------------------- suggestions
+
+  describe('Spec 002 — suggestions « Souvent commandés avec »', () => {
+    let shop: Account;
+    let ids: Record<string, string>;
+    const suggest = (guest: Guest, items: string[] = []) =>
+      t.http.get('/api/v1/guest/suggestions').query(items.length ? { items: items.join(',') } : {}).set(guest.headers);
+
+    beforeAll(async () => {
+      shop = await registerTenant(t, 'Maquis suggestions');
+      const plats = await category(shop, 'Plats');
+      const boissons = await category(shop, 'Boissons');
+      const desserts = await category(shop, 'Desserts');
+      ids = {
+        garba: await item(shop, plats, 'Garba', 1500),
+        alloco: await item(shop, plats, 'Alloco', 1000),
+        bissap: await item(shop, boissons, 'Bissap', 500),
+        eau: await item(shop, boissons, 'Eau', 1000),
+        degue: await item(shop, desserts, 'Dêguê', 1000),
+      };
+    });
+
+    it('CA-002-10 — sans historique : articles des rubriques absentes de la commande, dans l’ordre de la carte', async () => {
+      const guest = await openSession(t, (await createTable(t, shop)).code);
+      const res = await suggest(guest, [ids.garba]).expect(200);
+      expect(res.body.menuItemIds).toEqual([ids.bissap, ids.eau, ids.degue]);
+      // Panier vide : toute la carte, 6 au plus.
+      expect((await suggest(guest).expect(200)).body.menuItemIds).toEqual([ids.garba, ids.alloco, ids.bissap, ids.eau, ids.degue]);
+    });
+
+    it('CA-002-09 — l’article le plus souvent pris avec ceux de la commande passe en tête', async () => {
+      const table = await createTable(t, shop);
+      // Trois commandes servies avec Garba + Bissap, une avec Garba + Dêguê, une annulée avec Garba + Eau.
+      const place = async (items: string[]) => {
+        const guest = await openSession(t, table.code);
+        const res = await t.http.post('/api/v1/guest/orders').set(guest.headers).send({ items: items.map((menuItemId) => ({ menuItemId, quantity: 1 })) }).expect(200);
+        return res.body.request.id as string;
+      };
+      for (const items of [[ids.garba, ids.bissap], [ids.garba, ids.bissap], [ids.garba, ids.bissap], [ids.garba, ids.degue]]) {
+        await serve(shop, await place(items));
+      }
+      const cancelled = await place([ids.garba, ids.eau]);
+      await t.http.post(`${shop.base}/requests/${cancelled}/cancel`).set(shop.auth).send({}).expect(200);
+
+      const guest = await openSession(t, table.code);
+      const res = await suggest(guest, [ids.garba]).expect(200);
+      expect(res.body.menuItemIds.slice(0, 2)).toEqual([ids.bissap, ids.degue]);
+      expect(res.body.menuItemIds).not.toContain(ids.garba);
+      // Une fois Bissap dans la commande, il disparaît des suggestions.
+      expect((await suggest(guest, [ids.garba, ids.bissap]).expect(200)).body.menuItemIds).not.toContain(ids.bissap);
+    });
+
+    it('CA-002-11 — jamais un article épuisé, retiré ou étranger ; 6 au plus ; session obligatoire', async () => {
+      const guest = await openSession(t, (await createTable(t, shop)).code);
+      await t.http.patch(`${menu(shop)}/items/${ids.degue}`).set(shop.auth).send({ isAvailable: false }).expect(200);
+      await t.http.delete(`${menu(shop)}/items/${ids.eau}`).set(shop.auth).expect(204);
+      const other = await registerTenant(t, 'Autre maquis');
+      const foreign = await item(other, await category(other, 'Plats'), 'Étranger', 100);
+      const res = await suggest(guest, [ids.garba, foreign]).expect(200);
+      expect(res.body.menuItemIds).not.toContain(ids.degue);
+      expect(res.body.menuItemIds).not.toContain(ids.eau);
+      expect(res.body.menuItemIds).not.toContain(foreign);
+      expect(res.body.menuItemIds.length).toBeLessThanOrEqual(6);
+
+      await t.http.get('/api/v1/guest/suggestions').expect(401);
+      await suggest(guest, ['pas-un-uuid']).expect(400);
+      await suggest(guest, Array.from({ length: 31 }, () => ids.garba)).expect(400);
     });
   });
 
