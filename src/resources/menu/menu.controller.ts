@@ -6,6 +6,7 @@ import {
 } from 'class-validator';
 import { CurrentScope, RequirePermissions } from '../../commons/decorators';
 import type { Scope } from '../../commons/types';
+import { CATEGORY_ICONS } from './category-icons';
 import { MenuService } from './menu.service';
 
 const trim = ({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value);
@@ -13,11 +14,18 @@ const trim = ({ value }: { value: unknown }) => (typeof value === 'string' ? val
 export class MenuCategoryDto {
   @ApiProperty() @Transform(trim) @IsString() @MinLength(1) @MaxLength(40)
   name: string;
+
+  @ApiPropertyOptional({ enum: CATEGORY_ICONS, description: 'Pictogramme de la rubrique (spec 003)' })
+  @IsOptional() @IsIn([...CATEGORY_ICONS])
+  icon?: string;
 }
 
 export class UpdateMenuCategoryDto {
   @ApiPropertyOptional() @IsOptional() @Transform(trim) @IsString() @MinLength(1) @MaxLength(40)
   name?: string;
+
+  @ApiPropertyOptional({ enum: CATEGORY_ICONS }) @IsOptional() @IsIn([...CATEGORY_ICONS])
+  icon?: string;
 }
 
 export class MenuOrderDto {
@@ -99,6 +107,19 @@ export class MenuController {
   @RequirePermissions('menu.manage')
   archiveCategory(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string) {
     return this.menu.archiveCategory(scope, id);
+  }
+
+  @Put('categories/:id/image')
+  @RequirePermissions('menu.manage')
+  @ApiOperation({ summary: "Remplacer la photo d'une rubrique (remplace son pictogramme côté client)" })
+  setCategoryImage(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string, @Body() dto: MenuImageDto) {
+    return this.menu.setCategoryImage(scope, id, dto);
+  }
+
+  @Delete('categories/:id/image')
+  @RequirePermissions('menu.manage')
+  removeCategoryImage(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string) {
+    return this.menu.removeCategoryImage(scope, id);
   }
 
   @Post('items')

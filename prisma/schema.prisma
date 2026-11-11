@@ -489,12 +489,17 @@ model MenuCategory {
   tenantId        String    @db.Uuid
   establishmentId String    @db.Uuid
   name            String
+  /// Pictogramme de la rubrique (liste fermée, voir menu/category-icons.ts) : la carte se lit sans savoir lire (spec 003).
+  icon            String    @default("utensils")
+  /// Photo de la rubrique ; si présente, elle remplace le pictogramme côté client.
+  imageId         String?   @unique @db.Uuid
   position        Int       @default(0)
   createdAt       DateTime  @default(now()) @db.Timestamptz(3)
   updatedAt       DateTime  @updatedAt @db.Timestamptz(3)
   archivedAt      DateTime? @db.Timestamptz(3)
 
   establishment Establishment @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  image         MenuImage?    @relation(fields: [imageId], references: [id], onDelete: SetNull)
   items         MenuItem[]
 
   @@unique([id, establishmentId])
@@ -538,7 +543,8 @@ model MenuImage {
   data            Bytes
   createdAt       DateTime @default(now()) @db.Timestamptz(3)
 
-  item MenuItem?
+  item     MenuItem?
+  category MenuCategory?
 
   @@index([establishmentId])
 }

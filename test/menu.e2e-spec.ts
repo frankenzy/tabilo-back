@@ -206,6 +206,46 @@ describe('Spec 001 — carte et commandes', () => {
     });
   });
 
+  // -------------------------------------------------- images de rubrique
+
+  describe('Spec 003 — rubriques en images', () => {
+    it('CA-003-02 — pictogramme par défaut, choisi à la création, modifiable ; hors liste refusé', async () => {
+      const plain = await category(owner, 'Sans pictogramme');
+      const drinks = (await t.http.post(`${menu(owner)}/categories`).set(owner.auth).send({ name: 'Jus frais', icon: 'cup-soda' }).expect(201)).body;
+      expect(drinks).toMatchObject({ name: 'Jus frais', icon: 'cup-soda', imageId: null });
+      await t.http.patch(`${menu(owner)}/categories/${drinks.id}`).set(owner.auth).send({ icon: 'citrus' }).expect(200);
+      await t.http.post(`${menu(owner)}/categories`).set(owner.auth).send({ name: 'Fusée', icon: 'rocket' }).expect(400);
+      await t.http.patch(`${menu(owner)}/categories/${plain}`).set(owner.auth).send({ icon: '<svg>' }).expect(400);
+      const res = await t.http.get(menu(owner)).set(owner.auth).expect(200);
+      const byId = new Map((res.body as { id: string; icon: string }[]).map((c) => [c.id, c.icon]));
+      expect(byId.get(plain)).toBe('utensils');
+      expect(byId.get(drinks.id)).toBe('citrus');
+    });
+
+    it('CA-003-03 — une photo de rubrique remplace le pictogramme chez le client, auditée, contrôlée', async () => {
+      const fruits = (await t.http.post(`${menu(owner)}/categories`).set(owner.auth).send({ name: 'Fruits', icon: 'apple' }).expect(201)).body.id as string;
+      await item(owner, fruits, 'Ananas', 1000);
+      const url = `${menu(owner)}/categories/${fruits}/image`;
+      await t.http.put(url).set(waiter.auth).send({ mime: 'image/jpeg', data: jpeg() }).expect(403);
+      expect((await t.http.put(url).set(owner.auth).send({ mime: 'image/jpeg', data: jpeg(301 * 1024) }).expect(422)).body.code).toBe('IMAGE_TOO_LARGE');
+      const first = await t.http.put(url).set(owner.auth).send({ mime: 'image/jpeg', data: jpeg() }).expect(200);
+      const second = await t.http.put(url).set(owner.auth).send({ mime: 'image/jpeg', data: jpeg() }).expect(200);
+      expect(await t.prisma.menuImage.findUnique({ where: { id: first.body.imageId } })).toBeNull();
+
+      const guest = await openSession(t, (await createTable(t, owner)).code);
+      const context = await t.http.get('/api/v1/guest/session').set(guest.headers).expect(200);
+      expect((context.body.menu as { id: string }[]).find((c) => c.id === fruits)).toMatchObject({ icon: 'apple', imageId: second.body.imageId });
+      await t.http.get(`/api/v1/guest/menu-images/${second.body.imageId}`).expect(200);
+
+      const removed = await t.http.delete(url).set(owner.auth).expect(200);
+      expect(removed.body).toMatchObject({ icon: 'apple', imageId: null });
+      expect(await t.prisma.auditLog.count({ where: { entityId: fruits, action: { in: ['menu_category.image_updated', 'menu_category.image_removed'] } } })).toBe(3);
+
+      const intruder = await registerTenant(t, 'Intrus photo');
+      await t.http.put(`${menu(intruder)}/categories/${fruits}/image`).set(intruder.auth).send({ mime: 'image/jpeg', data: jpeg() }).expect(404);
+    });
+  });
+
   // ----------------------------------------------------------------- ordre
 
   describe('Ordre de la carte', () => {

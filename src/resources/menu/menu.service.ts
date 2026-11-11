@@ -16,6 +16,8 @@ export interface MenuItemView {
 export interface MenuCategoryView {
   id: string;
   name: string;
+  icon: string;
+  imageId: string | null;
   items: MenuItemView[];
 }
 
@@ -36,6 +38,20 @@ const IMAGE_SIGNATURES: Record<string, (bytes: Buffer) => boolean> = {
   'image/webp': (b) => b.subarray(0, 4).toString('ascii') === 'RIFF' && b.subarray(8, 12).toString('ascii') === 'WEBP',
 };
 
+const CATEGORY_SELECT = { id: true, name: true, icon: true, imageId: true } as const;
+
+/** Décode et contrôle une photo : type annoncé autorisé, taille, signature binaire conforme au type. */
+function decodeImage(dto: { mime: string; data: string }): Buffer<ArrayBuffer> {
+  const matches = IMAGE_SIGNATURES[dto.mime];
+  if (!matches) throw unprocessable('IMAGE_TYPE_UNSUPPORTED', 'Format accepté : JPEG, PNG ou WebP.');
+  const bytes = Buffer.from(dto.data, 'base64');
+  if (bytes.length === 0 || bytes.length > MAX_IMAGE_BYTES) {
+    throw unprocessable('IMAGE_TOO_LARGE', 'La photo dépasse 300 Ko.');
+  }
+  if (!matches(bytes)) throw unprocessable('IMAGE_INVALID', "Ce fichier n'est pas une image valide.");
+  return bytes;
+}
+
 const ITEM_SELECT = { id: true, name: true, description: true, priceMinor: true, imageId: true, isAvailable: true } as const;
 
 /** Carte de l'établissement : rubriques, articles, prix, disponibilité et photos. */
@@ -52,8 +68,7 @@ export class MenuService {
       where: { establishmentId, archivedAt: null },
       orderBy: [{ position: 'asc' }, { createdAt: 'asc' }],
       select: {
-        id: true,
-        name: true,
+        ...CATEGORY_SELECT,
         items: { where: { archivedAt: null }, orderBy: [{ position: 'asc' }, { createdAt: 'asc' }], select: ITEM_SELECT },
       },
     });
@@ -62,24 +77,24 @@ export class MenuService {
 
   // -------------------------------------------------------------- rubriques
 
-  async createCategory(scope: Scope, dto: { name: string }) {
+  async createCategory(scope: Scope, dto: { name: string; icon?: string }) {
     await this.assertCategoryNameFree(scope, dto.name);
     const last = await this.prisma.menuCategory.aggregate({ where: { ...this.where(scope), archivedAt: null }, _max: { position: true } });
     return this.prisma.$transaction(async (tx) => {
       const category = await tx.menuCategory.create({
-        data: { ...this.where(scope), name: dto.name, position: (last._max.position ?? -1) + 1 },
-        select: { id: true, name: true },
+        data: { ...this.where(scope), name: dto.name, icon: dto.icon, position: (last._max.position ?? -1) + 1 },
+        select: CATEGORY_SELECT,
       });
       await this.log(tx, scope, 'menu_category.created', 'MenuCategory', category.id);
       return { ...category, items: [] };
     });
   }
 
-  async updateCategory(scope: Scope, id: string, dto: { name?: string }) {
+  async updateCategory(scope: Scope, id: string, dto: { name?: string; icon?: string }) {
     const category = await this.findCategory(scope, id);
     if (dto.name && dto.name !== category.name) await this.assertCategoryNameFree(scope, dto.name);
     return this.prisma.$transaction(async (tx) => {
-      const updated = await tx.menuCategory.update({ where: { id }, data: dto, select: { id: true, name: true } });
+      const updated = await tx.menuCategory.update({ where: { id }, data: dto, select: CATEGORY_SELECT });
       await this.log(tx, scope, 'menu_category.updated', 'MenuCategory', id);
       return updated;
     });
@@ -150,13 +165,7 @@ export class MenuService {
   /** Remplace la photo d'un article. L'image arrive déjà réduite par le navigateur. */
   async setImage(scope: Scope, itemId: string, dto: { mime: string; data: string }): Promise<MenuItemView> {
     const item = await this.findItem(scope, itemId);
-    const matches = IMAGE_SIGNATURES[dto.mime];
-    if (!matches) throw unprocessable('IMAGE_TYPE_UNSUPPORTED', 'Format accepté : JPEG, PNG ou WebP.');
-    const bytes = Buffer.from(dto.data, 'base64');
-    if (bytes.length === 0 || bytes.length > MAX_IMAGE_BYTES) {
-      throw unprocessable('IMAGE_TOO_LARGE', 'La photo dépasse 300 Ko.');
-    }
-    if (!matches(bytes)) throw unprocessable('IMAGE_INVALID', "Ce fichier n'est pas une image valide.");
+    const bytes = decodeImage(dto);
     return this.prisma.$transaction(async (tx) => {
       const image = await tx.menuImage.create({ data: { ...this.where(scope), mime: dto.mime, data: bytes }, select: { id: true } });
       const updated = await tx.menuItem.update({ where: { id: itemId }, data: { imageId: image.id }, select: ITEM_SELECT });
@@ -173,6 +182,30 @@ export class MenuService {
       const updated = await tx.menuItem.update({ where: { id: itemId }, data: { imageId: null }, select: ITEM_SELECT });
       await tx.menuImage.delete({ where: { id: item.imageId as string } });
       await this.log(tx, scope, 'menu_item.image_removed', 'MenuItem', itemId);
+      return updated;
+    });
+  }
+
+  /** Photo de rubrique (spec 003) : remplace le pictogramme côté client. Mêmes contrôles qu'un article. */
+  async setCategoryImage(scope: Scope, categoryId: string, dto: { mime: string; data: string }) {
+    const category = await this.findCategory(scope, categoryId);
+    const bytes = decodeImage(dto);
+    return this.prisma.$transaction(async (tx) => {
+      const image = await tx.menuImage.create({ data: { ...this.where(scope), mime: dto.mime, data: bytes }, select: { id: true } });
+      const updated = await tx.menuCategory.update({ where: { id: categoryId }, data: { imageId: image.id }, select: CATEGORY_SELECT });
+      if (category.imageId) await tx.menuImage.delete({ where: { id: category.imageId } });
+      await this.log(tx, scope, 'menu_category.image_updated', 'MenuCategory', categoryId);
+      return updated;
+    });
+  }
+
+  async removeCategoryImage(scope: Scope, categoryId: string) {
+    const category = await this.findCategory(scope, categoryId);
+    if (!category.imageId) return this.prisma.menuCategory.findUniqueOrThrow({ where: { id: categoryId }, select: CATEGORY_SELECT });
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.menuCategory.update({ where: { id: categoryId }, data: { imageId: null }, select: CATEGORY_SELECT });
+      await tx.menuImage.delete({ where: { id: category.imageId as string } });
+      await this.log(tx, scope, 'menu_category.image_removed', 'MenuCategory', categoryId);
       return updated;
     });
   }
