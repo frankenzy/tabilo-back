@@ -1,17 +1,22 @@
 import {
-  Body, Controller, Get, Headers, HttpCode, Injectable, Module, Param, ParseUUIDPipe, Post, UseGuards,
+  Body, Controller, Get, Headers, HttpCode, Injectable, Module, Param, ParseUUIDPipe, Post, Res, UseGuards,
 } from '@nestjs/common';
+import type { FastifyReply } from 'fastify';
 import { ApiHeader, ApiOperation, ApiProperty, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { rateLimit } from '../../commons/utils/rate-limit';
-import { Transform } from 'class-transformer';
-import { IsOptional, IsString, IsUUID, Matches, MaxLength } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+import {
+  ArrayMaxSize, ArrayMinSize, IsArray, IsInt, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, ValidateNested,
+} from 'class-validator';
 import { CurrentGuest, Public } from '../../commons/decorators';
 import { GuestSessionGuard, SESSION_HEADER } from '../../commons/guards/guest-session.guard';
 import { PrismaService } from '../../commons/prisma/prisma.service';
 import type { GuestSession } from '../../commons/types';
 import { hashToken, randomToken } from '../../commons/utils/crypto';
 import { notFound, tooMany, unprocessable } from '../../commons/utils/errors';
+import { MenuModule } from '../menu/menu.module';
+import { MenuService } from '../menu/menu.service';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { NOTE_MAX_LENGTH } from '../service-requests/dto';
 import { ServiceRequestsModule } from '../service-requests/service-requests.module';
@@ -38,9 +43,30 @@ export class GuestCreateRequestDto {
   note?: string;
 }
 
+export class OrderLineDto {
+  @ApiProperty() @IsUUID()
+  menuItemId: string;
+
+  @ApiProperty({ minimum: 1, maximum: 20 }) @IsInt() @Min(1) @Max(20)
+  quantity: number;
+}
+
+export class GuestCreateOrderDto {
+  @ApiProperty({ type: [OrderLineDto], description: 'Identifiants et quantités seulement : les prix viennent de la carte.' })
+  @IsArray() @ArrayMinSize(1) @ArrayMaxSize(30) @ValidateNested({ each: true }) @Type(() => OrderLineDto)
+  items: OrderLineDto[];
+
+  @ApiPropertyOptional({ maxLength: NOTE_MAX_LENGTH })
+  @IsOptional() @Transform(trim) @IsString() @MaxLength(NOTE_MAX_LENGTH)
+  note?: string;
+}
+
 @Injectable()
 export class GuestService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly menu: MenuService,
+  ) {}
 
   /**
    * Ouvre une session de table à partir du QR. Le jeton renvoyé n'existe en clair que chez
@@ -84,8 +110,8 @@ export class GuestService {
 
   /** Ce que le client voit : nom du lieu, sa table, les demandes possibles. Rien d'autre. */
   async context(guest: Pick<GuestSession, 'establishmentId' | 'tableId'>) {
-    const [establishment, table, requestTypes] = await Promise.all([
-      this.prisma.establishment.findUniqueOrThrow({ where: { id: guest.establishmentId }, select: { name: true } }),
+    const [establishment, table, types, menu] = await Promise.all([
+      this.prisma.establishment.findUniqueOrThrow({ where: { id: guest.establishmentId }, select: { name: true, currency: true } }),
       this.prisma.diningTable.findUniqueOrThrow({
         where: { id: guest.tableId },
         select: { label: true, area: { select: { name: true } } },
@@ -93,13 +119,18 @@ export class GuestService {
       this.prisma.requestType.findMany({
         where: { establishmentId: guest.establishmentId, isActive: true, archivedAt: null },
         orderBy: [{ position: 'asc' }, { createdAt: 'asc' }],
-        select: { id: true, label: true, icon: true, allowNote: true },
+        select: { id: true, label: true, icon: true, allowNote: true, kind: true },
       }),
+      this.menu.overview(guest.establishmentId),
     ]);
+    const categories = menu.filter((category) => category.items.length > 0);
     return {
-      establishment: { name: establishment.name },
+      establishment: { name: establishment.name, currency: establishment.currency },
       table: { label: table.label, area: table.area.name },
-      requestTypes,
+      requestTypes: types.filter((type) => type.kind === 'service').map(({ kind: _kind, ...type }) => type),
+      menu: categories,
+      // La commande n'est proposée que si la carte existe et que le type « Commande » est actif.
+      orderingEnabled: categories.length > 0 && types.some((type) => type.kind === 'order'),
     };
   }
 }
@@ -111,6 +142,7 @@ export class GuestController {
   constructor(
     private readonly guests: GuestService,
     private readonly requests: ServiceRequestsService,
+    private readonly menu: MenuService,
   ) {}
 
   @Post('sessions')
@@ -148,10 +180,40 @@ export class GuestController {
     @Body() dto: GuestCreateRequestDto,
     @Headers('idempotency-key') idempotencyKey?: string,
   ) {
+    return this.requests.createByGuest(guest, { kind: 'service', ...dto }, this.key(idempotencyKey));
+  }
+
+  @Post('orders')
+  @HttpCode(200)
+  @UseGuards(GuestSessionGuard)
+  @Throttle(rateLimit(20, 60_000))
+  @ApiHeader({ name: SESSION_HEADER, required: true })
+  @ApiHeader({ name: 'idempotency-key', required: false, description: 'Rejouer la même clé renvoie la même commande.' })
+  @ApiOperation({ summary: 'Passer une commande depuis la carte' })
+  order(
+    @CurrentGuest() guest: GuestSession,
+    @Body() dto: GuestCreateOrderDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.requests.createByGuest(guest, { kind: 'order', ...dto }, this.key(idempotencyKey));
+  }
+
+  @Get('menu-images/:id')
+  @ApiOperation({ summary: "Photo d'un article de la carte" })
+  async image(@Param('id', ParseUUIDPipe) id: string, @Res() reply: FastifyReply): Promise<void> {
+    const image = await this.menu.image(id);
+    // Une photo ne change jamais sous le même identifiant : cache long, sans revalidation.
+    void reply
+      .header('content-type', image.mime)
+      .header('cache-control', 'public, max-age=31536000, immutable')
+      .send(image.data);
+  }
+
+  private key(idempotencyKey?: string): string | null {
     if (idempotencyKey !== undefined && !/^[A-Za-z0-9_-]{8,64}$/.test(idempotencyKey)) {
       throw unprocessable('IDEMPOTENCY_KEY_INVALID', "Clé d'idempotence invalide.");
     }
-    return this.requests.createByGuest(guest, dto, idempotencyKey ?? null);
+    return idempotencyKey ?? null;
   }
 
   @Post('requests/:id/cancel')
@@ -165,7 +227,7 @@ export class GuestController {
 }
 
 @Module({
-  imports: [ServiceRequestsModule, RealtimeModule],
+  imports: [ServiceRequestsModule, RealtimeModule, MenuModule],
   controllers: [GuestController],
   providers: [GuestService],
 })

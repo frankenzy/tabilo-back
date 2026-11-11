@@ -1,12 +1,16 @@
 import { Body, Controller, Get, Injectable, Module, Patch, Post } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiProperty, ApiPropertyOptional, ApiTags, PartialType } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsInt, IsOptional, IsString, IsTimeZone, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { IsIn, IsInt, IsOptional, IsString, IsTimeZone, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { CurrentScope, CurrentUser, RequirePermissions } from '../../commons/decorators';
 import { PrismaService } from '../../commons/prisma/prisma.service';
 import { AuditService } from '../../commons/services/audit.service';
 import type { AuthUser, Scope } from '../../commons/types';
 import { forbidden } from '../../commons/utils/errors';
+import { createEstablishmentDefaults } from './defaults';
+
+/** Devises proposées pour les prix de la carte. */
+export const CURRENCIES = ['XOF', 'XAF', 'EUR', 'USD', 'MAD', 'GNF', 'NGN', 'GHS', 'CDF', 'TND', 'DZD', 'CAD', 'CHF', 'GBP'] as const;
 
 const trim = ({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value);
 
@@ -22,6 +26,10 @@ export class CreateEstablishmentDto {
 
   @ApiPropertyOptional() @IsOptional() @Transform(trim) @IsString() @MaxLength(30)
   phone?: string;
+
+  @ApiPropertyOptional({ enum: CURRENCIES, description: 'Devise des prix de la carte' })
+  @IsOptional() @IsIn([...CURRENCIES])
+  currency?: string;
 }
 
 export class UpdateEstablishmentDto extends PartialType(CreateEstablishmentDto) {
@@ -40,7 +48,7 @@ export class UpdateEstablishmentDto extends PartialType(CreateEstablishmentDto) 
 }
 
 const SELECT = {
-  id: true, name: true, timezone: true, address: true, phone: true, sessionTtlMinutes: true,
+  id: true, name: true, timezone: true, currency: true, address: true, phone: true, sessionTtlMinutes: true,
   maxActiveRequestsPerTable: true, maxRequestsPerSession: true, requestCooldownSeconds: true,
 } as const;
 
@@ -94,6 +102,7 @@ export class EstablishmentsService {
       await tx.membership.create({
         data: { tenantId: user.tenantId, userId: user.id, establishmentId: establishment.id, roleId: ownerRole.id },
       });
+      await createEstablishmentDefaults(tx, { tenantId: user.tenantId, establishmentId: establishment.id });
       await this.audit.record(
         {
           action: 'establishment.created',

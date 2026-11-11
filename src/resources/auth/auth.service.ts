@@ -9,6 +9,7 @@ import { AuditService } from '../../commons/services/audit.service';
 import type { AuthUser } from '../../commons/types';
 import { hashToken, randomToken } from '../../commons/utils/crypto';
 import { conflict, unauthorized, unprocessable } from '../../commons/utils/errors';
+import { createEstablishmentDefaults } from '../establishments/defaults';
 import { ChangePasswordDto, LoginDto, RegisterDto } from './dto';
 
 const MAX_FAILED_LOGINS = 5;
@@ -39,14 +40,6 @@ export interface MeView {
     permissions: string[];
   }[];
 }
-
-const DEFAULT_REQUEST_TYPES = [
-  { label: 'Appeler un serveur', icon: 'bell', slaSeconds: 180, priority: 'normal' as const },
-  { label: "De l'eau", icon: 'droplet', slaSeconds: 180, priority: 'normal' as const },
-  { label: "L'addition", icon: 'receipt', slaSeconds: 240, priority: 'normal' as const },
-  { label: 'Assistance', icon: 'life-buoy', slaSeconds: 120, priority: 'high' as const },
-  { label: 'Autre demande', icon: 'message-circle', slaSeconds: 240, priority: 'normal' as const },
-];
 
 export async function hashPassword(password: string): Promise<string> {
   return argon2.hash(password, { type: argon2.argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 });
@@ -90,15 +83,7 @@ export class AuthService {
         data: { tenantId: tenant.id, userId: created.id, establishmentId: establishment.id, roleId: ownerRole.id },
       });
       const scoped = { tenantId: tenant.id, establishmentId: establishment.id };
-      await tx.requestType.createMany({
-        data: DEFAULT_REQUEST_TYPES.map((type, position) => ({ ...scoped, ...type, position })),
-      });
-      await tx.escalationRule.createMany({
-        data: [
-          { ...scoped, name: 'Non prise en charge après 5 min', trigger: 'not_accepted', afterSeconds: 300 },
-          { ...scoped, name: 'Non résolue après 15 min', trigger: 'not_resolved', afterSeconds: 900 },
-        ],
-      });
+      await createEstablishmentDefaults(tx, scoped);
       await this.audit.record(
         { action: 'tenant.registered', ...scoped, actorId: created.id, entityType: 'Tenant', entityId: tenant.id, ip: client.ip },
         tx,

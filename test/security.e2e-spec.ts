@@ -84,7 +84,7 @@ describe('Sécurité : authentification, isolation inter-tenant, permissions', (
   describe('isolation inter-tenant et IDOR', () => {
     it("répond 404 sur l'établissement d'un autre tenant, quelle que soit la route", async () => {
       const routes = ['', '/floor', '/requests', '/staff', '/roles', '/request-types', '/escalation-rules',
-        '/analytics/live', '/audit-logs', '/notifications', '/qr-codes'];
+        '/analytics/live', '/audit-logs', '/notifications', '/qr-codes', '/menu'];
       for (const route of routes) {
         const res = await t.http.get(`${b.base}${route}`).set(a.auth);
         expect({ route, status: res.status }).toEqual({ route, status: 404 });

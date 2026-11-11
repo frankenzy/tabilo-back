@@ -4,11 +4,18 @@ import { Prisma } from '@prisma/client';
 export const REQUEST_INCLUDE = {
   table: { select: { id: true, label: true } },
   area: { select: { id: true, name: true } },
-  requestType: { select: { id: true, label: true, icon: true } },
+  requestType: { select: { id: true, label: true, icon: true, kind: true } },
   assignee: { select: { id: true, firstName: true, lastName: true } },
+  items: { select: { name: true, quantity: true, unitPriceMinor: true }, orderBy: { name: 'asc' } },
 } satisfies Prisma.ServiceRequestInclude;
 
 export type RequestWithRelations = Prisma.ServiceRequestGetPayload<{ include: typeof REQUEST_INCLUDE }>;
+
+export interface OrderLineView {
+  name: string;
+  quantity: number;
+  unitPriceMinor: number;
+}
 
 /** Vue destinée au personnel. */
 export interface RequestView {
@@ -20,7 +27,11 @@ export interface RequestView {
   note: string | null;
   table: { id: string; label: string };
   area: { id: string; name: string };
-  type: { id: string; label: string; icon: string };
+  type: { id: string; label: string; icon: string; kind: 'service' | 'order' };
+  /** Lignes d'une commande (vide pour une demande de service). */
+  items: OrderLineView[];
+  /** Total d'une commande en unité mineure de la devise, sinon null. */
+  totalMinor: number | null;
   assignee: { id: string; firstName: string; lastName: string } | null;
   version: number;
   createdAt: string;
@@ -46,6 +57,8 @@ export function toRequestView(request: RequestWithRelations): RequestView {
     table: request.table,
     area: request.area,
     type: request.requestType,
+    items: request.items,
+    totalMinor: request.totalMinor,
     assignee: request.assignee,
     version: request.version,
     createdAt: request.createdAt.toISOString(),
@@ -62,11 +75,14 @@ export function toRequestView(request: RequestWithRelations): RequestView {
 /**
  * Vue destinée au client à table : le strict nécessaire au suivi.
  * Ni note (qui peut venir d'un autre téléphone), ni nom complet du personnel, ni données internes.
+ * Le contenu d'une commande est visible de toute la table : c'est ce qui arrivera sur la table.
  */
 export interface GuestRequestView {
   id: string;
   status: RequestWithRelations['status'];
-  type: { id: string; label: string; icon: string };
+  type: { id: string; label: string; icon: string; kind: 'service' | 'order' };
+  items: OrderLineView[];
+  totalMinor: number | null;
   handledBy: string | null;
   createdAt: string;
   acceptedAt: string | null;
@@ -81,6 +97,8 @@ export function toGuestRequestView(request: RequestWithRelations): GuestRequestV
     id: request.id,
     status: request.status,
     type: request.requestType,
+    items: request.items,
+    totalMinor: request.totalMinor,
     handledBy: handled && request.assignee ? request.assignee.firstName : null,
     createdAt: request.createdAt.toISOString(),
     acceptedAt: iso(request.acceptedAt),

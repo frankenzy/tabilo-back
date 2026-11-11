@@ -13,7 +13,8 @@ export async function createApp(): Promise<{ app: NestFastifyApplication; env: A
   const env = loadEnv();
   const adapter = new FastifyAdapter({
     trustProxy: true,
-    bodyLimit: 64 * 1024, // l'API n'accepte que de petits corps JSON
+    // Petits corps JSON ; le plafond laisse passer une photo d'article réduite (≤ 400 Ko en base64).
+    bodyLimit: 600 * 1024,
     genReqId: () => randomUUID(),
   });
   const app = await NestFactory.create<NestFastifyApplication>(AppModule, adapter, {

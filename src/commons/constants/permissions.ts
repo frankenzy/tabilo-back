@@ -9,6 +9,7 @@ export const PERMISSIONS = {
   'qr.manage': 'Générer, télécharger et révoquer les QR codes',
   'sessions.manage': 'Fermer les sessions de table',
   'request_types.manage': 'Configurer les types de demande',
+  'menu.manage': 'Gérer la carte : rubriques, articles, prix et photos',
   'requests.read': "Consulter les demandes de l'établissement",
   'requests.create': 'Créer une demande pour une table',
   'requests.handle': 'Accepter, traiter et résoudre des demandes',

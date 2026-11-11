@@ -14,6 +14,7 @@ import { EstablishmentsModule } from './resources/establishments/establishments'
 import { FloorModule } from './resources/floor/floor.module';
 import { GuestModule } from './resources/guest/guest';
 import { HealthModule } from './resources/health/health';
+import { MenuModule } from './resources/menu/menu.module';
 import { NotificationsModule } from './resources/notifications/notifications.module';
 import { OutboxModule } from './resources/outbox/outbox.module';
 import { RealtimeModule } from './resources/realtime/realtime.module';
@@ -40,6 +41,7 @@ import { TasksModule } from './tasks/tasks.module';
     StaffModule,
     FloorModule,
     RequestTypesModule,
+    MenuModule,
     ServiceRequestsModule,
     GuestModule,
     EscalationModule,

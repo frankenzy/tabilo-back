@@ -49,6 +49,23 @@ export interface RequestEventView {
   createdAt: string;
 }
 
+export interface OrderLineInput {
+  menuItemId: string;
+  quantity: number;
+}
+
+/** Ce qu'un client peut créer : une demande de service, ou une commande depuis la carte. */
+export type GuestCreateInput =
+  | { kind: 'service'; requestTypeId: string; note?: string }
+  | { kind: 'order'; items: OrderLineInput[]; note?: string };
+
+interface ResolvedLine {
+  menuItemId: string;
+  name: string;
+  unitPriceMinor: number;
+  quantity: number;
+}
+
 export interface GuestCreateResult {
   request: GuestRequestView;
   /** true si une demande existante a été renvoyée (rejeu idempotent ou doublon actif). */
@@ -139,7 +156,7 @@ export class ServiceRequestsService {
         select: { id: true, areaId: true },
       });
       if (!table) throw notFound('TABLE_NOT_FOUND', 'Table introuvable.');
-      const type = await this.loadActiveType(tx, scope.establishmentId, dto.requestTypeId);
+      const type = await this.loadServiceType(tx, scope.establishmentId, dto.requestTypeId);
       const created = await this.insert(tx, {
         scope,
         table,
@@ -167,7 +184,7 @@ export class ServiceRequestsService {
 
   async createByGuest(
     guest: GuestSession,
-    dto: { requestTypeId: string; note?: string },
+    input: GuestCreateInput,
     idempotencyKey: string | null,
   ): Promise<GuestCreateResult> {
     const result = await this.prisma.$transaction(async (tx) => {
@@ -193,12 +210,21 @@ export class ServiceRequestsService {
         }
       }
 
-      const type = await this.loadActiveType(tx, guest.establishmentId, dto.requestTypeId);
-      const duplicate = await tx.serviceRequest.findFirst({
-        where: { tableId: guest.tableId, requestTypeId: type.id, status: { in: [...ACTIVE_STATUSES] } },
-        select: { id: true },
-      });
-      if (duplicate) return { id: duplicate.id, deduplicated: true };
+      let type: Awaited<ReturnType<ServiceRequestsService['loadServiceType']>>;
+      let lines: ResolvedLine[] = [];
+      if (input.kind === 'service') {
+        type = await this.loadServiceType(tx, guest.establishmentId, input.requestTypeId);
+        // Une seule demande active par table et par type : un second appui renvoie l'existante.
+        const duplicate = await tx.serviceRequest.findFirst({
+          where: { tableId: guest.tableId, requestTypeId: type.id, status: { in: [...ACTIVE_STATUSES] } },
+          select: { id: true },
+        });
+        if (duplicate) return { id: duplicate.id, deduplicated: true };
+      } else {
+        // Plusieurs commandes peuvent coexister : pas de dédoublonnage, l'idempotence suffit.
+        type = await this.loadOrderType(tx, guest.establishmentId);
+        lines = await this.resolveLines(tx, guest.establishmentId, input.items);
+      }
 
       const [establishment, table, activeOnTable] = await Promise.all([
         tx.establishment.findUniqueOrThrow({
@@ -227,7 +253,8 @@ export class ServiceRequestsService {
         scope: { tenantId: guest.tenantId, establishmentId: guest.establishmentId },
         table,
         type,
-        note: type.allowNote ? dto.note : undefined,
+        note: type.allowNote ? input.note : undefined,
+        lines,
         source: 'customer',
         actor: { type: 'customer', id: null },
         sessionId: guest.id,
@@ -573,6 +600,7 @@ export class ServiceRequestsService {
       table: { id: string; areaId: string };
       type: { id: string; priority: ServiceRequest['priority']; slaSeconds: number };
       note?: string;
+      lines?: ResolvedLine[];
       source: ServiceRequest['source'];
       actor: Actor;
       sessionId: string | null;
@@ -580,6 +608,7 @@ export class ServiceRequestsService {
     },
   ): Promise<ServiceRequest> {
     const now = new Date();
+    const lines = input.lines ?? [];
     const created = await tx.serviceRequest.create({
       data: {
         tenantId: input.scope.tenantId,
@@ -593,10 +622,21 @@ export class ServiceRequestsService {
         priority: input.type.priority,
         createdById: input.actor.id,
         idempotencyKey: input.idempotencyKey,
+        totalMinor: lines.length > 0 ? lines.reduce((sum, line) => sum + line.unitPriceMinor * line.quantity, 0) : null,
         createdAt: now,
         dueAt: new Date(now.getTime() + input.type.slaSeconds * 1000),
       },
     });
+    if (lines.length > 0) {
+      await tx.serviceRequestItem.createMany({
+        data: lines.map((line) => ({
+          tenantId: created.tenantId,
+          establishmentId: created.establishmentId,
+          requestId: created.id,
+          ...line,
+        })),
+      });
+    }
     await tx.serviceRequestEvent.create({
       data: {
         tenantId: created.tenantId,
@@ -613,13 +653,48 @@ export class ServiceRequestsService {
     return created;
   }
 
-  private async loadActiveType(tx: Tx, establishmentId: string, requestTypeId: string) {
+  private async loadServiceType(tx: Tx, establishmentId: string, requestTypeId: string) {
     const type = await tx.requestType.findFirst({
-      where: { id: requestTypeId, establishmentId, isActive: true, archivedAt: null },
+      where: { id: requestTypeId, establishmentId, kind: 'service', isActive: true, archivedAt: null },
       select: { id: true, priority: true, slaSeconds: true, allowNote: true },
     });
     if (!type) throw notFound('REQUEST_TYPE_NOT_FOUND', 'Type de demande indisponible.');
     return type;
+  }
+
+  private async loadOrderType(tx: Tx, establishmentId: string) {
+    const type = await tx.requestType.findFirst({
+      where: { establishmentId, kind: 'order', isActive: true, archivedAt: null },
+      select: { id: true, priority: true, slaSeconds: true, allowNote: true },
+    });
+    if (!type) throw unprocessable('ORDERING_DISABLED', 'La commande en ligne est suspendue. Adressez-vous au personnel.');
+    return type;
+  }
+
+  /**
+   * Transforme les lignes envoyées par le client en lignes de commande. Le client ne fournit
+   * que des identifiants et des quantités : nom et prix viennent de la carte, relue en base,
+   * et l'article doit appartenir à CET établissement.
+   */
+  private async resolveLines(tx: Tx, establishmentId: string, items: OrderLineInput[]): Promise<ResolvedLine[]> {
+    const quantities = new Map<string, number>();
+    for (const item of items) quantities.set(item.menuItemId, (quantities.get(item.menuItemId) ?? 0) + item.quantity);
+    const found = await tx.menuItem.findMany({
+      where: { id: { in: [...quantities.keys()] }, establishmentId, archivedAt: null, category: { archivedAt: null } },
+      select: { id: true, name: true, priceMinor: true, isAvailable: true },
+    });
+    if (found.length !== quantities.size) {
+      throw unprocessable('MENU_ITEM_NOT_FOUND', "Un article n'est plus à la carte. Actualisez la page.");
+    }
+    const unavailable = found.find((item) => !item.isAvailable);
+    if (unavailable) {
+      throw unprocessable('MENU_ITEM_UNAVAILABLE', `« ${unavailable.name} » n'est plus disponible.`);
+    }
+    return found.map((item) => {
+      const quantity = quantities.get(item.id) ?? 0;
+      if (quantity > 50) throw unprocessable('QUANTITY_TOO_HIGH', `Quantité trop élevée pour « ${item.name} ».`);
+      return { menuItemId: item.id, name: item.name, unitPriceMinor: item.priceMinor, quantity };
+    });
   }
 
   /** Le destinataire doit être un membre actif de CET établissement, habilité à traiter. */

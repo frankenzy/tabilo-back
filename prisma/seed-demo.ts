@@ -1,8 +1,8 @@
 /**
  * Données de DÉMONSTRATION — jamais en production.
  *
- * Crée un tenant « Démo TABILO » avec un établissement, une équipe, des tables et une semaine
- * de demandes fictives, pour découvrir l'interface. Tout y est identifié comme démonstration.
+ * Crée un tenant « Démo TABILO » avec un établissement, une équipe, des tables, une carte et une
+ * semaine de demandes et de commandes fictives, pour découvrir l'interface. Tout y est identifié comme démonstration.
  *
  *   DEMO_PASSWORD='un-mot-de-passe-solide' npm run seed:demo
  *
@@ -79,6 +79,46 @@ async function main(): Promise<void> {
   for (const [position, def] of typeDefs.entries()) {
     types.push(await prisma.requestType.create({ data: { ...scoped, ...def, position } }));
   }
+  // Type « Commande » : un seul par établissement, utilisé par la carte (spec 001, R5).
+  const orderType = await prisma.requestType.create({
+    data: { ...scoped, label: 'Commande', kind: 'order', icon: 'utensils', slaSeconds: 300, position: 100 },
+  });
+
+  // Carte de démonstration (prix en F CFA, unité mineure = 1).
+  const menuDefs: [string, [string, string | null, number, boolean?][]][] = [
+    ['Plats', [
+      ['Garba', 'Attiéké, thon frit, piment', 1500],
+      ['Alloco poulet', 'Banane plantain frite, poulet braisé', 3000],
+      ['Attiéké poisson braisé', 'Carpe braisée, attiéké, oignons', 4500],
+      ['Kedjenou de poulet', 'Mijoté à l\'étouffée, riz blanc', 5000, false],
+    ]],
+    ['Boissons', [
+      ['Bissap', 'Jus d\'hibiscus maison', 500],
+      ['Gnamakoudji', 'Jus de gingembre maison', 500],
+      ['Eau minérale 1,5 L', null, 1000],
+      ['Bière locale 65 cl', null, 1500],
+    ]],
+    ['Desserts', [
+      ['Dêguê', 'Mil et lait caillé', 1000],
+      ['Salade de fruits', 'Fruits de saison', 1500],
+    ]],
+  ];
+  const menu: { id: string; name: string; priceMinor: number }[] = [];
+  for (const [position, [name, items]] of menuDefs.entries()) {
+    const category = await prisma.menuCategory.create({ data: { ...scoped, name, position } });
+    for (const [itemPosition, [itemName, description, priceMinor, isAvailable = true]] of items.entries()) {
+      const item = await prisma.menuItem.create({
+        data: { ...scoped, categoryId: category.id, name: itemName, description, priceMinor, isAvailable, position: itemPosition },
+      });
+      if (isAvailable) menu.push({ id: item.id, name: itemName, priceMinor });
+    }
+  }
+  /** Une à trois lignes tirées de la carte, quantités de 1 à 3. */
+  const randomLines = () => {
+    const chosen = [...menu].sort(() => Math.random() - 0.5).slice(0, 1 + Math.floor(Math.random() * 3));
+    return chosen.map((item) => ({ menuItemId: item.id, name: item.name, unitPriceMinor: item.priceMinor, quantity: 1 + Math.floor(Math.random() * 3) }));
+  };
+
   await prisma.escalationRule.createMany({
     data: [
       { ...scoped, name: 'Non prise en charge après 5 min', trigger: 'not_accepted', afterSeconds: 300 },
@@ -102,8 +142,13 @@ async function main(): Promise<void> {
   }
 
   /** Crée une demande dans l'état voulu, avec ses horodatages et ses événements cohérents. */
-  async function request(createdAt: Date, status: RequestStatus, options: { acceptAfter?: number; table?: number; type?: number; escalated?: boolean } = {}) {
-    const type = types[options.type ?? Math.floor(Math.random() * types.length)];
+  async function request(
+    createdAt: Date,
+    status: RequestStatus,
+    options: { acceptAfter?: number; table?: number; type?: number; escalated?: boolean; order?: boolean } = {},
+  ) {
+    const type = options.order ? orderType : types[options.type ?? Math.floor(Math.random() * types.length)];
+    const lines = options.order ? randomLines() : [];
     const table = options.table !== undefined ? tables[options.table] : pick(tables);
     const waiter = pick(waiters);
     const at = (seconds: number) => new Date(createdAt.getTime() + seconds * 1000);
@@ -118,7 +163,8 @@ async function main(): Promise<void> {
         tableId: table.id,
         areaId: table.areaId,
         requestTypeId: type.id,
-        source: Math.random() < 0.85 ? 'customer' : 'staff',
+        source: options.order || Math.random() < 0.85 ? 'customer' : 'staff',
+        totalMinor: options.order ? lines.reduce((sum, line) => sum + line.unitPriceMinor * line.quantity, 0) : null,
         priority: type.priority,
         status,
         createdAt,
@@ -133,6 +179,9 @@ async function main(): Promise<void> {
         escalatedAt: options.escalated ? at(300) : null,
       },
     });
+    if (lines.length > 0) {
+      await prisma.serviceRequestItem.createMany({ data: lines.map((line) => ({ ...scoped, requestId: created.id, ...line })) });
+    }
     const event = (type_: string, seconds: number, from: RequestStatus | null, to: RequestStatus, staff: boolean) =>
       events.push({ ...scoped, requestId: created.id, type: type_, fromStatus: from, toStatus: to, actorType: staff ? 'staff' : 'customer', actorId: staff ? waiter.id : null, createdAt: at(seconds) });
     event('request.created', 0, null, 'pending', false);
@@ -158,11 +207,13 @@ async function main(): Promise<void> {
       midnight.setUTCHours(0, 0, 0, 0);
       const hour = Math.random() < 0.45 ? between(12, 14.5) : between(19, 22.5);
       const createdAt = new Date(midnight.getTime() + hour * 3_600_000);
-      await request(createdAt, Math.random() < 0.07 ? 'cancelled' : 'resolved');
+      await request(createdAt, Math.random() < 0.07 ? 'cancelled' : 'resolved', { order: Math.random() < 0.4 });
     }
   }
   // Aujourd'hui : quelques demandes terminées et la situation en cours.
-  for (let i = 0; i < 9; i += 1) await request(new Date(now - between(40, 180) * 60_000), 'resolved');
+  for (let i = 0; i < 9; i += 1) await request(new Date(now - between(40, 180) * 60_000), 'resolved', { order: i % 3 === 0 });
+  await request(new Date(now - 90_000), 'pending', { table: 3, order: true });
+  await request(new Date(now - 240_000), 'accepted', { table: 11, order: true, acceptAfter: 60 });
   await request(new Date(now - 35_000), 'pending', { table: 0, type: 1 });
   await request(new Date(now - 130_000), 'pending', { table: 9, type: 0 });
   await request(new Date(now - 270_000), 'pending', { table: 4, type: 2 });

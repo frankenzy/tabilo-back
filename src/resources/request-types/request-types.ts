@@ -7,7 +7,7 @@ import { CurrentScope, RequirePermissions } from '../../commons/decorators';
 import { PrismaService } from '../../commons/prisma/prisma.service';
 import { AuditService } from '../../commons/services/audit.service';
 import type { Scope } from '../../commons/types';
-import { notFound } from '../../commons/utils/errors';
+import { conflict, notFound } from '../../commons/utils/errors';
 
 const trim = ({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value);
 
@@ -44,7 +44,7 @@ export class CreateRequestTypeDto {
 export class UpdateRequestTypeDto extends PartialType(CreateRequestTypeDto) {}
 
 const SELECT = {
-  id: true, label: true, icon: true, priority: true, slaSeconds: true, allowNote: true, isActive: true, position: true,
+  id: true, label: true, kind: true, icon: true, priority: true, slaSeconds: true, allowNote: true, isActive: true, position: true,
 } as const;
 
 @Injectable()
@@ -88,7 +88,10 @@ export class RequestTypesService {
 
   /** Archive : les demandes passées gardent leur type. */
   async archive(scope: Scope, id: string): Promise<void> {
-    await this.find(scope, id);
+    const type = await this.find(scope, id);
+    if (type.kind === 'order') {
+      throw conflict('ORDER_TYPE_REQUIRED', 'Le type « Commande » ne se supprime pas. Masquez-le pour suspendre les commandes.');
+    }
     await this.prisma.$transaction(async (tx) => {
       await tx.requestType.update({ where: { id }, data: { archivedAt: new Date(), isActive: false } });
       await this.audit.record({ action: 'request_type.archived', ...this.ctx(scope), entityType: 'RequestType', entityId: id }, tx);

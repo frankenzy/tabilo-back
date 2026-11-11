@@ -33,7 +33,7 @@ describe('Demandes : parcours client, cycle de vie, concurrence, escalade', () =
 
     it('ouvre une session sans exposer de donnée interne, jeton haché en base', async () => {
       const res = await t.http.post('/api/v1/guest/sessions').send({ code: floor.code }).expect(201);
-      expect(res.body.establishment).toEqual({ name: 'La Terrasse' });
+      expect(res.body.establishment).toEqual({ name: 'La Terrasse', currency: 'XOF' });
       expect(res.body.requestTypes.length).toBeGreaterThan(0);
       expect(JSON.stringify(res.body)).not.toContain(owner.establishmentId);
       const stored = await t.prisma.tableSession.findMany({ where: { tableId: floor.tableId } });

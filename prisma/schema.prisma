@@ -67,6 +67,13 @@ enum ActorType {
   system
 }
 
+enum RequestTypeKind {
+  /// Demande de service (serveur, eau, addition…), proposée telle quelle au client.
+  service
+  /// Commande passée depuis la carte. Un seul type de ce genre par établissement.
+  order
+}
+
 enum EscalationTrigger {
   not_accepted
   not_resolved
@@ -91,6 +98,8 @@ model Establishment {
   tenantId  String    @db.Uuid
   name      String
   timezone  String    @default("Africa/Abidjan")
+  /// Devise des prix de la carte (code ISO 4217).
+  currency  String    @default("XOF")
   address   String?
   phone     String?
   /// Durée de validité d'une session de table après un scan.
@@ -114,6 +123,8 @@ model Establishment {
   requestTypes    RequestType[]
   requests        ServiceRequest[]
   escalationRules EscalationRule[]
+  menuCategories  MenuCategory[]
+  menuItems       MenuItem[]
 
   @@index([tenantId])
 }
@@ -290,6 +301,7 @@ model RequestType {
   tenantId        String          @db.Uuid
   establishmentId String          @db.Uuid
   label           String
+  kind            RequestTypeKind @default(service)
   icon            String          @default("bell")
   priority        RequestPriority @default(normal)
   /// Délai cible de prise en charge (acceptation), en secondes. Au-delà, la demande est « en retard ».
@@ -327,6 +339,8 @@ model ServiceRequest {
   assigneeId       String?          @db.Uuid
   createdById      String?          @db.Uuid
   idempotencyKey   String?
+  /// Total d'une commande, en unité mineure de la devise. NULL pour une demande de service.
+  totalMinor       Int?
   /// Verrou optimiste : incrémenté à chaque transition.
   version          Int              @default(0)
   createdAt        DateTime         @default(now()) @db.Timestamptz(3)
@@ -347,6 +361,7 @@ model ServiceRequest {
   assignee      User?               @relation("RequestAssignee", fields: [assigneeId], references: [id], onDelete: Restrict)
   assignments   ServiceAssignment[]
   events        ServiceRequestEvent[]
+  items         ServiceRequestItem[]
 
   @@unique([establishmentId, idempotencyKey])
   @@index([establishmentId, status, createdAt])
@@ -466,4 +481,81 @@ model OutboxEvent {
 
   @@index([publishedAt, id])
   @@index([establishmentId, id])
+}
+
+/// Rubrique de la carte (entrées, plats, boissons…).
+model MenuCategory {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @db.Uuid
+  establishmentId String    @db.Uuid
+  name            String
+  position        Int       @default(0)
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @db.Timestamptz(3)
+  archivedAt      DateTime? @db.Timestamptz(3)
+
+  establishment Establishment @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  items         MenuItem[]
+
+  @@unique([id, establishmentId])
+  @@index([establishmentId, archivedAt])
+}
+
+/// Article de la carte. Le prix est un entier en unité mineure de la devise de l'établissement
+/// (1 500 F CFA = 1500 ; 8,50 € = 850) : jamais de nombre à virgule pour de l'argent.
+model MenuItem {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @db.Uuid
+  establishmentId String    @db.Uuid
+  categoryId      String    @db.Uuid
+  name            String
+  description     String?
+  priceMinor      Int
+  imageId         String?   @unique @db.Uuid
+  /// false = en rupture : affiché, mais non commandable.
+  isAvailable     Boolean   @default(true)
+  position        Int       @default(0)
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @db.Timestamptz(3)
+  archivedAt      DateTime? @db.Timestamptz(3)
+
+  establishment Establishment @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  category      MenuCategory  @relation(fields: [categoryId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
+  image         MenuImage?    @relation(fields: [imageId], references: [id], onDelete: SetNull)
+
+  @@unique([id, establishmentId])
+  @@index([establishmentId, archivedAt])
+  @@index([categoryId])
+}
+
+/// Photo d'un article, stockée en base (image réduite par le navigateur avant envoi).
+/// Servie publiquement par son identifiant imprévisible : une photo de plat n'est pas un secret.
+model MenuImage {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  establishmentId String   @db.Uuid
+  mime            String
+  data            Bytes
+  createdAt       DateTime @default(now()) @db.Timestamptz(3)
+
+  item MenuItem?
+
+  @@index([establishmentId])
+}
+
+/// Ligne d'une commande. Nom et prix sont figés à la commande : modifier la carte ensuite
+/// ne réécrit pas l'historique.
+model ServiceRequestItem {
+  id              String  @id @default(uuid()) @db.Uuid
+  tenantId        String  @db.Uuid
+  establishmentId String  @db.Uuid
+  requestId       String  @db.Uuid
+  menuItemId      String  @db.Uuid
+  name            String
+  unitPriceMinor  Int
+  quantity        Int
+
+  request ServiceRequest @relation(fields: [requestId], references: [id], onDelete: Restrict)
+
+  @@index([requestId])
 }
