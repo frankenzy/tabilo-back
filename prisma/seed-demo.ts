@@ -12,6 +12,7 @@ import { Prisma, PrismaClient, RequestStatus } from '@prisma/client';
 import * as argon2 from 'argon2';
 import { randomBytes } from 'node:crypto';
 import { SYSTEM_ROLES } from '../src/commons/constants/permissions';
+import { demoPhoto } from './demo-images';
 
 const prisma = new PrismaClient();
 const DEMO_TENANT = 'Démo TABILO';
@@ -85,30 +86,35 @@ async function main(): Promise<void> {
   });
 
   // Carte de démonstration (prix en F CFA, unité mineure = 1).
-  const menuDefs: [string, [string, string | null, number, boolean?][]][] = [
-    ['Plats', [
+  const menuDefs: [string, string, [string, string | null, number, boolean?][]][] = [
+    ['Plats', 'utensils', [
       ['Garba', 'Attiéké, thon frit, piment', 1500],
       ['Alloco poulet', 'Banane plantain frite, poulet braisé', 3000],
       ['Attiéké poisson braisé', 'Carpe braisée, attiéké, oignons', 4500],
       ['Kedjenou de poulet', 'Mijoté à l\'étouffée, riz blanc', 5000, false],
     ]],
-    ['Boissons', [
+    ['Boissons', 'cup-soda', [
       ['Bissap', 'Jus d\'hibiscus maison', 500],
       ['Gnamakoudji', 'Jus de gingembre maison', 500],
       ['Eau minérale 1,5 L', null, 1000],
       ['Bière locale 65 cl', null, 1500],
     ]],
-    ['Desserts', [
+    ['Desserts', 'ice-cream', [
       ['Dêguê', 'Mil et lait caillé', 1000],
       ['Salade de fruits', 'Fruits de saison', 1500],
     ]],
   ];
   const menu: { id: string; name: string; priceMinor: number }[] = [];
-  for (const [position, [name, items]] of menuDefs.entries()) {
-    const category = await prisma.menuCategory.create({ data: { ...scoped, name, position } });
+  /** Photo libre de droits (prisma/demo-images, voir CREDITS.md), si le jeu en prévoit une. */
+  const photo = async (name: string) => {
+    const data = demoPhoto(name);
+    return data ? (await prisma.menuImage.create({ data: { ...scoped, mime: 'image/jpeg', data } })).id : null;
+  };
+  for (const [position, [name, icon, items]] of menuDefs.entries()) {
+    const category = await prisma.menuCategory.create({ data: { ...scoped, name, icon, position, imageId: await photo(name) } });
     for (const [itemPosition, [itemName, description, priceMinor, isAvailable = true]] of items.entries()) {
       const item = await prisma.menuItem.create({
-        data: { ...scoped, categoryId: category.id, name: itemName, description, priceMinor, isAvailable, position: itemPosition },
+        data: { ...scoped, categoryId: category.id, name: itemName, description, priceMinor, isAvailable, position: itemPosition, imageId: await photo(itemName) },
       });
       if (isAvailable) menu.push({ id: item.id, name: itemName, priceMinor });
     }
