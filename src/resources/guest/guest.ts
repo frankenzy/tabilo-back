@@ -125,7 +125,7 @@ export class GuestService {
   /** Ce que le client voit : nom du lieu, sa table, les demandes possibles. Rien d'autre. */
   async context(guest: Pick<GuestSession, 'establishmentId' | 'tableId'>) {
     const [establishment, table, types, menu] = await Promise.all([
-      this.prisma.establishment.findUniqueOrThrow({ where: { id: guest.establishmentId }, select: { name: true, currency: true } }),
+      this.prisma.establishment.findUniqueOrThrow({ where: { id: guest.establishmentId }, select: { name: true, currency: true, pairingsEnabled: true } }),
       this.prisma.diningTable.findUniqueOrThrow({
         where: { id: guest.tableId },
         select: { label: true, area: { select: { name: true } } },
@@ -145,6 +145,8 @@ export class GuestService {
       menu: categories,
       // La commande n'est proposée que si la carte existe et que le type « Commande » est actif.
       orderingEnabled: categories.length > 0 && types.some((type) => type.kind === 'order'),
+      // Spec 012, R7 : « Souvent pris avec » dans la fiche d'un plat, si l'établissement l'a activé.
+      pairingsEnabled: establishment.pairingsEnabled,
     };
   }
 }
