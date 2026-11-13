@@ -103,7 +103,7 @@ export class EscalationService {
        AND e."isActive" AND e."archivedAt" IS NULL
        AND (e."requestTypeId" IS NULL OR e."requestTypeId" = r."requestTypeId")
       WHERE r."escalationStatus" = 'none'
-        AND r.status IN ('pending', 'assigned', 'accepted', 'in_progress')
+        AND r.status IN ('pending', 'assigned', 'accepted', 'in_progress', 'ready')
         AND (${requestId ?? null}::uuid IS NULL OR r.id = ${requestId ?? null}::uuid)
         AND r."createdAt" + make_interval(secs => e."afterSeconds") <= now()
         AND (

@@ -41,6 +41,8 @@ enum RequestStatus {
   assigned
   accepted
   in_progress
+  /// Spec 007 : commande prête, en attente d'être servie (établissements à cuisine séparée).
+  ready
   resolved
   cancelled
 }
@@ -110,6 +112,10 @@ model Establishment {
   maxRequestsPerSession     Int @default(30)
   /// Délai minimal entre deux demandes d'une même session.
   requestCooldownSeconds    Int @default(10)
+  /// Spec 007 : une cuisine séparée signale les commandes prêtes au serveur (étape « Prête »).
+  separateKitchen           Boolean @default(false)
+  /// Spec 012, R7 : rangée « Souvent pris avec » dans la fiche d'un plat (désactivée par défaut).
+  pairingsEnabled           Boolean @default(false)
   createdAt DateTime  @default(now()) @db.Timestamptz(3)
   updatedAt DateTime  @updatedAt @db.Timestamptz(3)
   archivedAt DateTime? @db.Timestamptz(3)
@@ -180,6 +186,8 @@ model Membership {
   userId          String   @db.Uuid
   establishmentId String   @db.Uuid
   roleId          String   @db.Uuid
+  /// Spec 010 : permissions du rôle retirées à cet employé. Effectives = rôle − retirées ; jamais au-delà du rôle.
+  revokedPermissions String[] @default([])
   createdAt       DateTime @default(now()) @db.Timestamptz(3)
 
   user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -351,6 +359,7 @@ model ServiceRequest {
   assignedAt       DateTime?        @db.Timestamptz(3)
   acceptedAt       DateTime?        @db.Timestamptz(3)
   startedAt        DateTime?        @db.Timestamptz(3)
+  readyAt          DateTime?        @db.Timestamptz(3)
   resolvedAt       DateTime?        @db.Timestamptz(3)
   cancelledAt      DateTime?        @db.Timestamptz(3)
   escalatedAt      DateTime?        @db.Timestamptz(3)

@@ -52,6 +52,22 @@ export class ServiceRequestsController {
     return this.requests.start(scope, id);
   }
 
+  @Post(':id/prepare')
+  @HttpCode(200)
+  @RequirePermissions('requests.handle')
+  @ApiOperation({ summary: 'Préparer une commande : accepter et démarrer en un geste (spec 007)' })
+  prepare(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string) {
+    return this.requests.prepare(scope, id);
+  }
+
+  @Post(':id/ready')
+  @HttpCode(200)
+  @RequirePermissions('requests.handle')
+  @ApiOperation({ summary: 'Signaler une commande prête (cuisine séparée, spec 007)' })
+  ready(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string) {
+    return this.requests.markReady(scope, id);
+  }
+
   @Post(':id/resolve')
   @HttpCode(200)
   @RequirePermissions('requests.handle')

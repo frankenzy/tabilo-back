@@ -1,7 +1,7 @@
 import { Body, Controller, Get, Injectable, Module, Patch, Post } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiProperty, ApiPropertyOptional, ApiTags, PartialType } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsIn, IsInt, IsOptional, IsString, IsTimeZone, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsOptional, IsString, IsTimeZone, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { CurrentScope, CurrentUser, RequirePermissions } from '../../commons/decorators';
 import { PrismaService } from '../../commons/prisma/prisma.service';
 import { AuditService } from '../../commons/services/audit.service';
@@ -45,11 +45,19 @@ export class UpdateEstablishmentDto extends PartialType(CreateEstablishmentDto) 
 
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(0) @Max(300)
   requestCooldownSeconds?: number;
+
+  @ApiPropertyOptional({ description: 'Cuisine séparée : étape « Prête » des commandes (spec 007)' })
+  @IsOptional() @IsBoolean()
+  separateKitchen?: boolean;
+
+  @ApiPropertyOptional({ description: "« Souvent pris avec » dans la fiche d'un plat (spec 012, R7)" })
+  @IsOptional() @IsBoolean()
+  pairingsEnabled?: boolean;
 }
 
 const SELECT = {
   id: true, name: true, timezone: true, currency: true, address: true, phone: true, sessionTtlMinutes: true,
-  maxActiveRequestsPerTable: true, maxRequestsPerSession: true, requestCooldownSeconds: true,
+  maxActiveRequestsPerTable: true, maxRequestsPerSession: true, requestCooldownSeconds: true, separateKitchen: true, pairingsEnabled: true,
 } as const;
 
 @Injectable()

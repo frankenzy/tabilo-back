@@ -114,7 +114,7 @@ describe('Spec 001 — carte et commandes', () => {
       const guestMenu = await t.http.get('/api/v1/guest/session').set(guest.headers).expect(200);
       expect(JSON.stringify(guestMenu.body.menu)).not.toContain(dish);
       const kept = await t.http.get(`${owner.base}/requests/${placed.body.request.id}`).set(owner.auth).expect(200);
-      expect(kept.body.items).toEqual([{ name: 'Plat éphémère', quantity: 1, unitPriceMinor: 2500 }]);
+      expect(kept.body.items).toEqual([expect.objectContaining({ name: 'Plat éphémère', quantity: 1, unitPriceMinor: 2500 })]);
     });
 
     it('CA-001-07 — ajoute une photo puis la remplace, l’ancienne est supprimée ; le retrait est audité', async () => {
@@ -340,8 +340,8 @@ describe('Spec 001 — carte et commandes', () => {
       expect(created.totalMinor).toBe(3500);
       expect(created.items).toEqual(
         expect.arrayContaining([
-          { name: 'Garba client', quantity: 2, unitPriceMinor: 1500 },
-          { name: 'Bissap client', quantity: 1, unitPriceMinor: 500 },
+          expect.objectContaining({ name: 'Garba client', quantity: 2, unitPriceMinor: 1500 }),
+          expect.objectContaining({ name: 'Bissap client', quantity: 1, unitPriceMinor: 500 }),
         ]),
       );
       const saved = await t.prisma.serviceRequest.findUniqueOrThrow({ where: { id: created.id }, include: { requestType: true } });
@@ -449,7 +449,7 @@ describe('Spec 001 — carte et commandes', () => {
       const merged = await order(guest, Array.from({ length: 3 }, () => ({ menuItemId: garba, quantity: 20 }))).expect(422);
       expect(merged.body.code).toBe('QUANTITY_TOO_HIGH');
       const ok = await order(guest, [{ menuItemId: garba, quantity: 2 }, { menuItemId: garba, quantity: 3 }]).expect(200);
-      expect(ok.body.request.items).toEqual([{ name: 'Garba client', quantity: 5, unitPriceMinor: 1500 }]);
+      expect(ok.body.request.items).toEqual([expect.objectContaining({ name: 'Garba client', quantity: 5, unitPriceMinor: 1500 })]);
     });
 
     it('CA-001-26 — le client suit ses commandes avec lignes et total, sans note ni nom de famille', async () => {

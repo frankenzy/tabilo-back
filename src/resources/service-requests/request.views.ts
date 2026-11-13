@@ -6,12 +6,14 @@ export const REQUEST_INCLUDE = {
   area: { select: { id: true, name: true } },
   requestType: { select: { id: true, label: true, icon: true, kind: true } },
   assignee: { select: { id: true, firstName: true, lastName: true } },
-  items: { select: { name: true, quantity: true, unitPriceMinor: true }, orderBy: { name: 'asc' } },
+  items: { select: { menuItemId: true, name: true, quantity: true, unitPriceMinor: true }, orderBy: { name: 'asc' } },
 } satisfies Prisma.ServiceRequestInclude;
 
 export type RequestWithRelations = Prisma.ServiceRequestGetPayload<{ include: typeof REQUEST_INCLUDE }>;
 
 export interface OrderLineView {
+  /** Spec 007 : retrouver la photo du plat dans la carte (écran « Commandes »). */
+  menuItemId: string;
   name: string;
   quantity: number;
   unitPriceMinor: number;
@@ -41,6 +43,7 @@ export interface RequestView {
   assignedAt: string | null;
   acceptedAt: string | null;
   startedAt: string | null;
+  readyAt: string | null;
   resolvedAt: string | null;
   cancelledAt: string | null;
   escalatedAt: string | null;
@@ -69,6 +72,7 @@ export function toRequestView(request: RequestWithRelations): RequestView {
     assignedAt: iso(request.assignedAt),
     acceptedAt: iso(request.acceptedAt),
     startedAt: iso(request.startedAt),
+    readyAt: iso(request.readyAt),
     resolvedAt: iso(request.resolvedAt),
     cancelledAt: iso(request.cancelledAt),
     escalatedAt: iso(request.escalatedAt),
@@ -96,10 +100,11 @@ export interface GuestRequestView {
 }
 
 export function toGuestRequestView(request: RequestWithRelations): GuestRequestView {
-  const handled = request.status === 'accepted' || request.status === 'in_progress' || request.status === 'resolved';
+  const handled = request.status === 'accepted' || request.status === 'in_progress' || request.status === 'ready' || request.status === 'resolved';
   return {
     id: request.id,
-    status: request.status,
+    // Spec 007, Q2 : le client reste sur « En préparation » jusqu'au service.
+    status: request.status === 'ready' ? 'in_progress' : request.status,
     type: request.requestType,
     items: request.items,
     totalMinor: request.totalMinor,

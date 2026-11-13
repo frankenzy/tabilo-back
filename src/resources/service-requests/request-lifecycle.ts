@@ -7,7 +7,8 @@ import type { RequestStatus } from '@prisma/client';
  *   pending     → assigned | cancelled
  *   assigned    → accepted | pending (libération justifiée)
  *   accepted    → in_progress | cancelled (selon permissions)
- *   in_progress → resolved | assigned (transfert)
+ *   in_progress → ready | resolved | assigned (transfert)
+ *   ready       → resolved (spec 007 : commande prête, servie par n'importe quel membre)
  *   resolved, cancelled : terminaux
  *
  * L'escalade est un axe distinct (none → escalated → acknowledged) : une demande
@@ -17,13 +18,14 @@ export const TRANSITIONS: Readonly<Record<RequestStatus, readonly RequestStatus[
   pending: ['assigned', 'cancelled'],
   assigned: ['accepted', 'pending'],
   accepted: ['in_progress', 'cancelled'],
-  in_progress: ['resolved', 'assigned'],
+  in_progress: ['ready', 'resolved', 'assigned'],
+  ready: ['resolved'],
   resolved: [],
   cancelled: [],
 };
 
 export const TERMINAL_STATUSES: readonly RequestStatus[] = ['resolved', 'cancelled'];
-export const ACTIVE_STATUSES: readonly RequestStatus[] = ['pending', 'assigned', 'accepted', 'in_progress'];
+export const ACTIVE_STATUSES: readonly RequestStatus[] = ['pending', 'assigned', 'accepted', 'in_progress', 'ready'];
 
 export function canTransition(from: RequestStatus, to: RequestStatus): boolean {
   return TRANSITIONS[from].includes(to);

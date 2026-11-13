@@ -7,7 +7,7 @@ import {
   TRANSITIONS,
 } from './request-lifecycle';
 
-const ALL: RequestStatus[] = ['pending', 'assigned', 'accepted', 'in_progress', 'resolved', 'cancelled'];
+const ALL: RequestStatus[] = ['pending', 'assigned', 'accepted', 'in_progress', 'ready', 'resolved', 'cancelled'];
 
 describe('cycle de vie des demandes', () => {
   const allowed: [RequestStatus, RequestStatus][] = [
@@ -19,6 +19,9 @@ describe('cycle de vie des demandes', () => {
     ['accepted', 'cancelled'],
     ['in_progress', 'resolved'],
     ['in_progress', 'assigned'],
+    // Spec 007 : étape « Prête », qu'on ne peut plus annuler (CA-007-11).
+    ['in_progress', 'ready'],
+    ['ready', 'resolved'],
   ];
 
   it.each(allowed)('autorise %s → %s', (from, to) => {

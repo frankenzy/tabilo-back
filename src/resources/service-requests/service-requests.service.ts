@@ -20,6 +20,7 @@ const STATUS_LABELS: Record<RequestStatus, string> = {
   assigned: 'affectée',
   accepted: 'acceptée',
   in_progress: 'en cours',
+  ready: 'prête',
   resolved: 'résolue',
   cancelled: 'annulée',
 };
@@ -332,9 +333,54 @@ export class ServiceRequestsService {
     });
   }
 
+  /**
+   * Spec 007 : « Préparer » accepte et démarre une commande en un seul geste.
+   * Depuis « en attente » (auto-affectation), ou depuis « affectée » / « acceptée » par soi.
+   */
+  async prepare(scope: Scope, id: string): Promise<RequestView> {
+    return this.mutate(scope, id, async (tx, current) => {
+      if (current.totalMinor === null) throw unprocessable('NOT_AN_ORDER', "Seule une commande se prépare depuis l'écran « Commandes ».");
+      const takenByOther = current.assigneeId !== null && current.assigneeId !== scope.userId;
+      if (takenByOther || !['pending', 'assigned', 'accepted'].includes(current.status)) {
+        const holder = current.assigneeId
+          ? await tx.user.findUnique({ where: { id: current.assigneeId }, select: { firstName: true } })
+          : null;
+        throw conflict('ALREADY_TAKEN', holder ? `Déjà prise par ${holder.firstName}.` : `Action impossible : la commande est ${STATUS_LABELS[current.status]}.`);
+      }
+      let request = current;
+      if (request.status === 'pending') {
+        request = await this.stepAssign(tx, request, scope.userId, staffActor(scope), { silent: true });
+      }
+      if (request.status === 'assigned') request = await this.stepAccept(tx, request, staffActor(scope));
+      await this.step(tx, request, 'in_progress', { startedAt: request.startedAt ?? new Date() }, {
+        eventType: 'request.started',
+        actor: staffActor(scope),
+      });
+    });
+  }
+
+  /** Spec 007 : la cuisine signale la commande prête (établissements à cuisine séparée seulement). */
+  async markReady(scope: Scope, id: string): Promise<RequestView> {
+    return this.mutate(scope, id, async (tx, current) => {
+      const establishment = await tx.establishment.findUniqueOrThrow({
+        where: { id: current.establishmentId },
+        select: { separateKitchen: true },
+      });
+      if (!establishment.separateKitchen) {
+        throw conflict('READY_DISABLED', "L'étape « Prête » n'est pas activée pour cet établissement.");
+      }
+      this.assertOwnerOrSupervisor(scope, current);
+      await this.step(tx, current, 'ready', { readyAt: new Date() }, {
+        eventType: 'request.ready',
+        actor: staffActor(scope),
+      });
+    });
+  }
+
   async resolve(scope: Scope, id: string): Promise<RequestView> {
     return this.mutate(scope, id, async (tx, current) => {
-      this.assertOwnerOrSupervisor(scope, current);
+      // Spec 007 : une commande prête est servie par le serveur, qui n'est pas forcément celui qui l'a préparée.
+      if (current.status !== 'ready') this.assertOwnerOrSupervisor(scope, current);
       await this.step(tx, current, 'resolved', { resolvedAt: new Date() }, {
         eventType: 'request.resolved',
         actor: staffActor(scope),
@@ -709,6 +755,7 @@ export class ServiceRequestsService {
         tenantId: scope.tenantId,
         user: { status: 'active' },
         role: { permissions: { has: 'requests.handle' } },
+        NOT: { revokedPermissions: { has: 'requests.handle' } },
       },
       select: { id: true },
     });

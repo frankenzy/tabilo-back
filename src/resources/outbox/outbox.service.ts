@@ -7,6 +7,7 @@ export type DomainEventType =
   | 'request.assigned'
   | 'request.accepted'
   | 'request.started'
+  | 'request.ready'
   | 'request.resolved'
   | 'request.cancelled'
   | 'request.transferred'
