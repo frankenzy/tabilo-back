@@ -1,3 +1,4 @@
+import { isAllowedOrigin } from '../../commons/utils/origins';
 import { Logger, OnModuleInit } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { OnGatewayInit, WebSocketGateway, WebSocketServer } from '@nestjs/websockets';
@@ -29,7 +30,7 @@ const sessionRoom = (sessionId: string) => `session:${sessionId}`;
 @WebSocketGateway({
   cors: {
     origin: (origin: string | undefined, callback: (error: Error | null, allow?: boolean) => void) => {
-      callback(null, !origin || loadEnv().corsOrigins.includes(origin));
+      callback(null, isAllowedOrigin(origin, loadEnv()));
     },
     credentials: true,
   },
@@ -79,6 +80,7 @@ export class RealtimeGateway implements OnGatewayInit, OnModuleInit {
         tenantId: payload.tid,
         user: { status: 'active' },
         role: { permissions: { has: 'requests.read' } },
+        NOT: { revokedPermissions: { has: 'requests.read' } },
       },
       select: { id: true },
     });

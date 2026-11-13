@@ -1,3 +1,4 @@
+import { isAllowedOrigin } from './commons/utils/origins';
 import fastifyCookie from '@fastify/cookie';
 import helmet from '@fastify/helmet';
 import { ValidationPipe, VersioningType } from '@nestjs/common';
@@ -30,7 +31,8 @@ export async function createApp(): Promise<{ app: NestFastifyApplication; env: A
   await app.register(fastifyCookie);
 
   app.enableCors({
-    origin: env.corsOrigins,
+    // Hors production, le réseau local est aussi accepté (tests sur téléphone) : voir isAllowedOrigin.
+    origin: (origin: string | undefined, callback: (error: Error | null, allow: boolean) => void) => callback(null, isAllowedOrigin(origin, env)),
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], // PUT : ordre de la carte et photos (spec 001)
     allowedHeaders: ['content-type', 'authorization', 'x-table-session', 'idempotency-key'],
