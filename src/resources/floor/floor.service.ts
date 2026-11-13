@@ -51,6 +51,8 @@ export interface OccupationOrderView {
   createdAt: string;
   resolvedAt: string | null;
   totalMinor: number;
+  /** Spec 022 : précisions du client (note composée), ou null. */
+  note: string | null;
   items: { menuItemId: string; name: string; quantity: number; unitPriceMinor: number; imageId: string | null }[];
 }
 
@@ -225,7 +227,7 @@ export class FloorService {
       orderBy: { createdAt: 'desc' },
       take: 50,
       select: {
-        id: true, status: true, createdAt: true, resolvedAt: true, totalMinor: true,
+        id: true, status: true, createdAt: true, resolvedAt: true, totalMinor: true, note: true,
         items: { select: { menuItemId: true, name: true, quantity: true, unitPriceMinor: true }, orderBy: { name: 'asc' } },
       },
     });
@@ -246,6 +248,7 @@ export class FloorService {
         createdAt: request.createdAt.toISOString(),
         resolvedAt: request.resolvedAt?.toISOString() ?? null,
         totalMinor: request.totalMinor ?? 0,
+        note: request.note,
         items: request.items.map((item) => ({ ...item, imageId: images.get(item.menuItemId) ?? null })),
       })),
     };
