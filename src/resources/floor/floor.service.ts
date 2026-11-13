@@ -25,6 +25,25 @@ export interface AreaView {
   tables: TableView[];
 }
 
+/** Carte de la vue « Tables » (spec 006). */
+export interface TableStatusView {
+  id: string;
+  label: string;
+  seats: number;
+  areaId: string;
+  areaName: string;
+  status: 'occupied' | 'free';
+  /** Commandes non annulées depuis l'ouverture de la plus ancienne session ouverte. NULL si la table est libre. */
+  amountMinor: number | null;
+}
+
+export interface TablesOverview {
+  currency: string;
+  /** Commandes non annulées depuis minuit, heure de l'établissement. */
+  ordersToday: number;
+  tables: TableStatusView[];
+}
+
 export interface QrView {
   tableId: string;
   tableLabel: string;
@@ -77,6 +96,68 @@ export class FloorService {
           hasActiveQr: table.qrCodes.length > 0,
         })),
     }));
+  }
+
+  /** Vue « Tables » du gérant et du propriétaire (spec 006). */
+  async tablesOverview(scope: Scope): Promise<TablesOverview> {
+    const [establishment] = await this.prisma.$queryRaw<{ currency: string; ordersToday: number }[]>`
+      SELECT est.currency,
+        (SELECT count(*)::int FROM "ServiceRequest" r
+          WHERE r."establishmentId" = est.id AND r."tenantId" = est."tenantId"
+            AND r."totalMinor" IS NOT NULL AND r.status <> 'cancelled'
+            AND r."createdAt" >= date_trunc('day', now() AT TIME ZONE est.timezone) AT TIME ZONE est.timezone
+        ) AS "ordersToday"
+      FROM "Establishment" est
+      WHERE est.id = ${scope.establishmentId}::uuid AND est."tenantId" = ${scope.tenantId}::uuid`;
+    if (!establishment) throw notFound('ESTABLISHMENT_NOT_FOUND', 'Établissement introuvable.');
+
+    const rows = await this.prisma.$queryRaw<
+      { id: string; label: string; seats: number; areaId: string; areaName: string; areaPosition: number; occupiedSince: Date | null; amountMinor: number | null }[]
+    >`
+      -- Début de l'occupation (spec 006, R2 et R4) : plus ancienne session ouverte,
+      -- ou plus ancienne demande encore en cours si le client s'est déconnecté entre-temps.
+      WITH open_since AS (
+        SELECT "tableId", min(since) AS since FROM (
+          SELECT s."tableId", s."openedAt" AS since
+          FROM "TableSession" s
+          WHERE s."establishmentId" = ${scope.establishmentId}::uuid AND s."tenantId" = ${scope.tenantId}::uuid
+            AND s.status = 'open' AND s."expiresAt" > now()
+          UNION ALL
+          SELECT r."tableId", r."createdAt" AS since
+          FROM "ServiceRequest" r
+          WHERE r."establishmentId" = ${scope.establishmentId}::uuid AND r."tenantId" = ${scope.tenantId}::uuid
+            AND r.status IN ('pending', 'assigned', 'accepted', 'in_progress', 'ready')
+        ) starts
+        GROUP BY "tableId"
+      )
+      SELECT t.id, t.label, t.seats, a.id AS "areaId", a.name AS "areaName", a.position AS "areaPosition",
+        o.since AS "occupiedSince",
+        CASE WHEN o.since IS NULL THEN NULL ELSE (
+          SELECT coalesce(sum(r."totalMinor"), 0)::int FROM "ServiceRequest" r
+          WHERE r."tableId" = t.id AND r."establishmentId" = t."establishmentId"
+            AND r."totalMinor" IS NOT NULL AND r.status <> 'cancelled' AND r."createdAt" >= o.since
+        ) END AS "amountMinor"
+      FROM "DiningTable" t
+      JOIN "DiningArea" a ON a.id = t."areaId" AND a."archivedAt" IS NULL
+      LEFT JOIN open_since o ON o."tableId" = t.id
+      WHERE t."establishmentId" = ${scope.establishmentId}::uuid AND t."tenantId" = ${scope.tenantId}::uuid
+        AND t."archivedAt" IS NULL`;
+
+    const collator = new Intl.Collator('fr', { numeric: true });
+    rows.sort((a, b) => a.areaPosition - b.areaPosition || collator.compare(a.label, b.label));
+    return {
+      currency: establishment.currency,
+      ordersToday: establishment.ordersToday,
+      tables: rows.map((row) => ({
+        id: row.id,
+        label: row.label,
+        seats: row.seats,
+        areaId: row.areaId,
+        areaName: row.areaName,
+        status: row.occupiedSince ? 'occupied' : 'free',
+        amountMinor: row.occupiedSince ? row.amountMinor : null,
+      })),
+    };
   }
 
   async createArea(scope: Scope, dto: { name: string }) {

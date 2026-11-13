@@ -56,6 +56,13 @@ export class FloorController {
     return this.floor.overview(scope);
   }
 
+  @Get('tables/overview')
+  @RequirePermissions('analytics.read')
+  @ApiOperation({ summary: 'Vue « Tables » : état, taille et montant de chaque table, commandes du jour (spec 006)' })
+  tablesOverview(@CurrentScope() scope: Scope) {
+    return this.floor.tablesOverview(scope);
+  }
+
   @Post('areas')
   @RequirePermissions('floor.manage')
   createArea(@CurrentScope() scope: Scope, @Body() dto: CreateAreaDto) {
