@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { isPermissionKey } from '../../commons/constants/permissions';
+import { effectivePermissions, isPermissionKey } from '../../commons/constants/permissions';
 import { PrismaService, Tx } from '../../commons/prisma/prisma.service';
 import { AuditService } from '../../commons/services/audit.service';
 import type { Scope } from '../../commons/types';
@@ -15,6 +15,12 @@ export interface StaffView {
   mustChangePassword: boolean;
   lastLoginAt: string | null;
   role: { id: string; key: string; name: string };
+  /** Spec 010 : toutes les permissions du rôle (bornes de l'ajustement). */
+  rolePermissions: string[];
+  /** Permissions effectives : rôle moins retraits. */
+  permissions: string[];
+  /** Permissions retirées à cet employé ; vide = rôle complet. */
+  revokedPermissions: string[];
   canHandleRequests: boolean;
 }
 
@@ -111,7 +117,8 @@ export class StaffService {
           lockedUntil: passwordHash ? null : undefined,
         },
       });
-      if (role) await tx.membership.update({ where: { id: membership.id }, data: { roleId: role.id } });
+      // Spec 010, R5 : un nouveau rôle repart complet, sans les retraits de l'ancien.
+      if (role) await tx.membership.update({ where: { id: membership.id }, data: { roleId: role.id, revokedPermissions: [] } });
       // Désactivation, changement de rôle ou de mot de passe : les sessions ouvertes tombent.
       if (dto.status === 'disabled' || passwordHash || role) {
         await tx.refreshSession.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
@@ -121,6 +128,43 @@ export class StaffService {
         status: dto.status ?? null,
         passwordReset: Boolean(passwordHash),
       });
+      return tx.membership.findUniqueOrThrow({ where: { id: membership.id }, include: INCLUDE });
+    });
+    return this.toView(updated);
+  }
+
+  /**
+   * Spec 010 : ajuste les permissions d'un employé dans les limites de son rôle.
+   * `wanted` est l'ensemble effectif voulu ; on enregistre ce qui est retiré par rapport au rôle.
+   */
+  async setPermissions(scope: Scope, userId: string, wanted: string[]): Promise<StaffView> {
+    const membership = await this.find(scope, userId);
+    if (userId === scope.userId) {
+      throw unprocessable('SELF_CHANGE_FORBIDDEN', 'Vous ne pouvez pas ajuster vos propres permissions.');
+    }
+    if (membership.role.key === 'owner') {
+      throw forbidden('OWNER_PROTECTED', 'Un propriétaire garde toujours toutes ses permissions.');
+    }
+    const role = membership.role.permissions.filter(isPermissionKey);
+    const outside = wanted.filter((permission) => !role.includes(permission as never));
+    if (outside.length > 0) {
+      throw unprocessable('PERMISSION_OUTSIDE_ROLE', 'Une permission demandée ne fait pas partie du rôle de cet employé.');
+    }
+    const before = new Set(effectivePermissions(membership.role.permissions, membership.revokedPermissions));
+    const after = new Set(wanted);
+    // R3 : on ne change l'état que des permissions que l'on détient soi-même.
+    const touched = role.filter((permission) => before.has(permission) !== after.has(permission));
+    if (touched.some((permission) => !scope.permissions.has(permission))) {
+      throw forbidden('PRIVILEGE_ESCALATION', 'Vous ne pouvez ajuster que des permissions que vous détenez vous-même.');
+    }
+    const revoked = role.filter((permission) => !after.has(permission));
+    const updated = await this.prisma.$transaction(async (tx) => {
+      await tx.membership.update({ where: { id: membership.id }, data: { revokedPermissions: revoked } });
+      // R6 : ses sessions ouvertes tombent, ses droits se rechargent à la reconnexion.
+      if (touched.length > 0) {
+        await tx.refreshSession.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
+      }
+      await this.log(tx, scope, 'staff.permissions_updated', userId, { revoked: revoked.join(',') || null });
       return tx.membership.findUniqueOrThrow({ where: { id: membership.id }, include: INCLUDE });
     });
     return this.toView(updated);
@@ -179,7 +223,9 @@ export class StaffService {
   private toView(m: {
     user: { id: string; email: string; firstName: string; lastName: string; status: 'active' | 'disabled'; mustChangePassword: boolean; lastLoginAt: Date | null };
     role: { id: string; key: string; name: string; permissions: string[] };
+    revokedPermissions: string[];
   }): StaffView {
+    const permissions = effectivePermissions(m.role.permissions, m.revokedPermissions);
     return {
       id: m.user.id,
       email: m.user.email,
@@ -189,7 +235,10 @@ export class StaffService {
       mustChangePassword: m.user.mustChangePassword,
       lastLoginAt: m.user.lastLoginAt ? m.user.lastLoginAt.toISOString() : null,
       role: { id: m.role.id, key: m.role.key, name: m.role.name },
-      canHandleRequests: m.role.permissions.includes('requests.handle'),
+      rolePermissions: m.role.permissions.filter(isPermissionKey),
+      permissions,
+      revokedPermissions: m.revokedPermissions.filter((p) => m.role.permissions.includes(p)),
+      canHandleRequests: permissions.includes('requests.handle'),
     };
   }
 }

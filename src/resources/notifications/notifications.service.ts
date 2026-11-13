@@ -56,6 +56,7 @@ export class NotificationsService implements OnModuleInit {
           tenantId: event.tenantId,
           user: { status: 'active' },
           role: { permissions: { has: 'requests.supervise' } },
+          NOT: { revokedPermissions: { has: 'requests.supervise' } },
         },
         select: { userId: true },
       });

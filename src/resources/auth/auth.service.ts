@@ -1,3 +1,4 @@
+import { effectivePermissions } from '../../commons/constants/permissions';
 import { Inject, Injectable } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as argon2 from 'argon2';
@@ -212,7 +213,8 @@ export class AuthService {
       memberships: row.memberships.map((m) => ({
         establishment: m.establishment,
         role: { key: m.role.key, name: m.role.name },
-        permissions: m.role.permissions,
+        // Spec 010 : permissions effectives, pour les menus et les pages.
+        permissions: effectivePermissions(m.role.permissions, m.revokedPermissions),
       })),
     };
   }

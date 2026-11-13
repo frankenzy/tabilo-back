@@ -2,7 +2,7 @@ import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { JwtService } from '@nestjs/jwt';
 import { isUUID } from 'class-validator';
-import { isPermissionKey, PermissionKey } from '../constants/permissions';
+import { effectivePermissions, isPermissionKey, PermissionKey } from '../constants/permissions';
 import { IS_PUBLIC, REQUIRED_PERMISSIONS } from '../decorators';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../services/audit.service';
@@ -66,13 +66,14 @@ export class AccessGuard implements CanActivate {
     const membership = isUUID(establishmentId)
       ? await this.prisma.membership.findFirst({
           where: { userId: user.id, establishmentId, tenantId: user.tenantId, establishment: { archivedAt: null } },
-          select: { role: { select: { key: true, permissions: true } } },
+          select: { revokedPermissions: true, role: { select: { key: true, permissions: true } } },
         })
       : null;
     if (!membership) {
       throw notFound('ESTABLISHMENT_NOT_FOUND', 'Établissement introuvable.');
     }
-    const permissions = new Set(membership.role.permissions.filter(isPermissionKey));
+    // Spec 010 : permissions effectives (rôle moins retraits propres à l'employé).
+    const permissions = new Set(effectivePermissions(membership.role.permissions, membership.revokedPermissions));
     const missing = required.filter((permission) => !permissions.has(permission));
     if (missing.length > 0) {
       await this.audit.recordSafely({

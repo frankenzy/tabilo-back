@@ -1,7 +1,7 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post, Put } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiProperty, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsEmail, IsIn, IsOptional, IsString, IsUUID, MaxLength, MinLength } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsEmail, IsIn, IsOptional, IsString, IsUUID, MaxLength, MinLength } from 'class-validator';
 import { CurrentScope, RequirePermissions } from '../../commons/decorators';
 import type { Scope } from '../../commons/types';
 import { PASSWORD_MIN_LENGTH } from '../auth/dto';
@@ -46,6 +46,12 @@ export class UpdateStaffDto {
   password?: string;
 }
 
+export class StaffPermissionsDto {
+  @ApiProperty({ type: [String], description: 'Permissions effectives voulues, toutes incluses dans le rôle (spec 010).' })
+  @IsArray() @ArrayMaxSize(100) @IsString({ each: true })
+  permissions: string[];
+}
+
 @ApiTags('Équipe')
 @ApiBearerAuth()
 @Controller({ path: 'establishments/:establishmentId/staff', version: '1' })
@@ -69,5 +75,12 @@ export class StaffController {
   @RequirePermissions('staff.manage')
   update(@CurrentScope() scope: Scope, @Param('userId', ParseUUIDPipe) userId: string, @Body() dto: UpdateStaffDto) {
     return this.staff.update(scope, userId, dto);
+  }
+
+  @Put(':userId/permissions')
+  @RequirePermissions('staff.manage')
+  @ApiOperation({ summary: "Ajuster les permissions d'un employé dans les limites de son rôle (spec 010)" })
+  setPermissions(@CurrentScope() scope: Scope, @Param('userId', ParseUUIDPipe) userId: string, @Body() dto: StaffPermissionsDto) {
+    return this.staff.setPermissions(scope, userId, dto.permissions);
   }
 }

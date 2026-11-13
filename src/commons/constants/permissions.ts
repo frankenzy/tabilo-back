@@ -32,6 +32,15 @@ export function isPermissionKey(value: string): value is PermissionKey {
   return Object.prototype.hasOwnProperty.call(PERMISSIONS, value);
 }
 
+/**
+ * Spec 010, R1 : permissions effectives d'un employé = celles de son rôle, moins celles qu'on lui a retirées.
+ * Un retrait ne peut jamais ajouter : le résultat est toujours inclus dans le rôle.
+ */
+export function effectivePermissions(rolePermissions: readonly string[], revoked: readonly string[] = []): PermissionKey[] {
+  const removed = new Set(revoked);
+  return rolePermissions.filter(isPermissionKey).filter((permission) => !removed.has(permission));
+}
+
 export interface SystemRoleDefinition {
   key: 'owner' | 'manager' | 'waiter';
   name: string;
