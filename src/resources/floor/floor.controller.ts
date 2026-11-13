@@ -63,6 +63,13 @@ export class FloorController {
     return this.floor.tablesOverview(scope);
   }
 
+  @Get('tables/:id/occupation')
+  @RequirePermissions('floor.read')
+  @ApiOperation({ summary: "Occupation d'une table : arrivée des clients, téléphones connectés, commandes (spec 020)" })
+  tableOccupation(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string) {
+    return this.floor.tableOccupation(scope, id);
+  }
+
   @Post('areas')
   @RequirePermissions('floor.manage')
   createArea(@CurrentScope() scope: Scope, @Body() dto: CreateAreaDto) {

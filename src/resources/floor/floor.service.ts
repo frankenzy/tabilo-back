@@ -44,6 +44,33 @@ export interface TablesOverview {
   tables: TableStatusView[];
 }
 
+/** Spec 020 : une commande de l'occupation en cours, pour la fiche d'une table. */
+export interface OccupationOrderView {
+  id: string;
+  status: string;
+  createdAt: string;
+  resolvedAt: string | null;
+  totalMinor: number;
+  items: { menuItemId: string; name: string; quantity: number; unitPriceMinor: number; imageId: string | null }[];
+}
+
+/** Spec 020, R2 et R4 : ce que la fiche d'une table montre de son occupation. */
+export interface TableOccupationView {
+  tableId: string;
+  /** Devise de l'établissement, pour les montants. */
+  currency: string;
+  /** Arrivée des clients (même règle que la vue « Tables », spec 006, R4) ; NULL si la table est libre. */
+  occupiedSince: string | null;
+  /** Sessions client ouvertes : les téléphones connectés à la table. */
+  openSessions: number;
+  /** Commandes non annulées de l'occupation ; NULL si la table est libre. */
+  amountMinor: number | null;
+  /** Table libre : fin de la dernière occupation, si elle date du jour (heure de l'établissement). */
+  lastOccupiedAt: string | null;
+  /** Commandes de l'occupation, la plus récente d'abord ; vide si la table est libre. */
+  orders: OccupationOrderView[];
+}
+
 export interface QrView {
   tableId: string;
   tableLabel: string;
@@ -156,6 +183,70 @@ export class FloorService {
         areaName: row.areaName,
         status: row.occupiedSince ? 'occupied' : 'free',
         amountMinor: row.occupiedSince ? row.amountMinor : null,
+      })),
+    };
+  }
+
+  /** Spec 020 : occupation d'une table pour sa fiche (arrivée, téléphones, commandes). */
+  async tableOccupation(scope: Scope, tableId: string): Promise<TableOccupationView> {
+    await this.findTable(scope, tableId);
+    const establishment = await this.prisma.establishment.findFirst({ where: { id: scope.establishmentId, tenantId: scope.tenantId }, select: { currency: true } });
+    if (!establishment) throw notFound('ESTABLISHMENT_NOT_FOUND', 'Établissement introuvable.');
+    const currency = establishment.currency;
+    const where = { ...this.where(scope), tableId };
+    const now = new Date();
+    const [sessions, oldestActive] = await Promise.all([
+      this.prisma.tableSession.findMany({ where: { ...where, status: 'open', expiresAt: { gt: now } }, select: { openedAt: true } }),
+      this.prisma.serviceRequest.findFirst({
+        where: { ...where, status: { in: [...ACTIVE_STATUSES] } },
+        orderBy: { createdAt: 'asc' },
+        select: { createdAt: true },
+      }),
+    ]);
+    // Même règle que la vue « Tables » (spec 006, R2 et R4) : plus ancienne session ouverte ou demande encore en cours.
+    const starts = [...sessions.map((session) => session.openedAt.getTime()), ...(oldestActive ? [oldestActive.createdAt.getTime()] : [])];
+    const since = starts.length > 0 ? new Date(Math.min(...starts)) : null;
+
+    if (!since) {
+      const [row] = await this.prisma.$queryRaw<{ last: Date | null; dayStart: Date }[]>`
+        SELECT greatest(
+            (SELECT max(s."closedAt") FROM "TableSession" s WHERE s."tableId" = ${tableId}::uuid AND s."establishmentId" = est.id),
+            (SELECT max(coalesce(r."resolvedAt", r."cancelledAt")) FROM "ServiceRequest" r WHERE r."tableId" = ${tableId}::uuid AND r."establishmentId" = est.id)
+          ) AS last,
+          date_trunc('day', now() AT TIME ZONE est.timezone) AT TIME ZONE est.timezone AS "dayStart"
+        FROM "Establishment" est
+        WHERE est.id = ${scope.establishmentId}::uuid AND est."tenantId" = ${scope.tenantId}::uuid`;
+      const last = row?.last && row.last >= row.dayStart ? row.last.toISOString() : null;
+      return { tableId, currency, occupiedSince: null, openSessions: 0, amountMinor: null, lastOccupiedAt: last, orders: [] };
+    }
+
+    const requests = await this.prisma.serviceRequest.findMany({
+      where: { ...where, totalMinor: { not: null }, createdAt: { gte: since } },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      select: {
+        id: true, status: true, createdAt: true, resolvedAt: true, totalMinor: true,
+        items: { select: { menuItemId: true, name: true, quantity: true, unitPriceMinor: true }, orderBy: { name: 'asc' } },
+      },
+    });
+    const menuIds = [...new Set(requests.flatMap((request) => request.items.map((item) => item.menuItemId)))];
+    const images = new Map(
+      (await this.prisma.menuItem.findMany({ where: { id: { in: menuIds }, ...this.where(scope) }, select: { id: true, imageId: true } })).map((item) => [item.id, item.imageId]),
+    );
+    return {
+      tableId,
+      currency,
+      occupiedSince: since.toISOString(),
+      openSessions: sessions.length,
+      amountMinor: requests.filter((request) => request.status !== 'cancelled').reduce((sum, request) => sum + (request.totalMinor ?? 0), 0),
+      lastOccupiedAt: null,
+      orders: requests.map((request) => ({
+        id: request.id,
+        status: request.status,
+        createdAt: request.createdAt.toISOString(),
+        resolvedAt: request.resolvedAt?.toISOString() ?? null,
+        totalMinor: request.totalMinor ?? 0,
+        items: request.items.map((item) => ({ ...item, imageId: images.get(item.menuItemId) ?? null })),
       })),
     };
   }
