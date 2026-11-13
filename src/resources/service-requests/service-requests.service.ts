@@ -286,7 +286,8 @@ export class ServiceRequestsService {
       },
       include: REQUEST_INCLUDE,
       orderBy: { createdAt: 'desc' },
-      take: 20,
+      // Spec 018, R8 : toute la soirée, pour que le total servi soit juste.
+      take: 50,
     });
     return rows.map(toGuestRequestView);
   }
