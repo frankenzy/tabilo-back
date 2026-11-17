@@ -66,10 +66,10 @@ export class OptionalReasonDto {
 }
 
 export class ListRequestsQuery extends PaginationQuery {
-  @ApiPropertyOptional({ enum: ['active', 'closed', 'all'], default: 'active' })
+  @ApiPropertyOptional({ enum: ['active', 'closed', 'unpaid', 'all'], default: 'active', description: '`unpaid` : commandes servies non réglées (spec 026).' })
   @IsOptional()
-  @IsIn(['active', 'closed', 'all'])
-  scope: 'active' | 'closed' | 'all' = 'active';
+  @IsIn(['active', 'closed', 'unpaid', 'all'])
+  scope: 'active' | 'closed' | 'unpaid' | 'all' = 'active';
 
   @ApiPropertyOptional({ enum: RequestStatus })
   @IsOptional()
@@ -91,4 +91,9 @@ export class ListRequestsQuery extends PaginationQuery {
 
   @ApiPropertyOptional() @IsOptional() @Type(() => Date) @IsDate() from?: Date;
   @ApiPropertyOptional() @IsOptional() @Type(() => Date) @IsDate() to?: Date;
+}
+
+/** Spec 026, R4 : régler toutes les commandes servies non réglées de l'occupation d'une table. */
+export class SettleTableDto {
+  @ApiProperty() @IsUUID() tableId: string;
 }

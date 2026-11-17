@@ -35,6 +35,8 @@ export interface TableStatusView {
   status: 'occupied' | 'free';
   /** Commandes non annulées depuis l'ouverture de la plus ancienne session ouverte. NULL si la table est libre. */
   amountMinor: number | null;
+  /** Spec 026 : commandes servies non réglées de l'occupation. NULL si la table est libre. */
+  unpaidMinor: number | null;
 }
 
 export interface TablesOverview {
@@ -50,6 +52,8 @@ export interface OccupationOrderView {
   status: string;
   createdAt: string;
   resolvedAt: string | null;
+  /** Spec 026 : commande servie réglée, sinon null. */
+  paidAt: string | null;
   totalMinor: number;
   /** Spec 022 : précisions du client (note composée), ou null. */
   note: string | null;
@@ -67,6 +71,8 @@ export interface TableOccupationView {
   openSessions: number;
   /** Commandes non annulées de l'occupation ; NULL si la table est libre. */
   amountMinor: number | null;
+  /** Spec 026, R4 : commandes servies non réglées de l'occupation ; NULL si la table est libre. */
+  unpaidMinor: number | null;
   /** Table libre : fin de la dernière occupation, si elle date du jour (heure de l'établissement). */
   lastOccupiedAt: string | null;
   /** Commandes de l'occupation, la plus récente d'abord ; vide si la table est libre. */
@@ -141,7 +147,7 @@ export class FloorService {
     if (!establishment) throw notFound('ESTABLISHMENT_NOT_FOUND', 'Établissement introuvable.');
 
     const rows = await this.prisma.$queryRaw<
-      { id: string; label: string; seats: number; areaId: string; areaName: string; areaPosition: number; occupiedSince: Date | null; amountMinor: number | null }[]
+      { id: string; label: string; seats: number; areaId: string; areaName: string; areaPosition: number; occupiedSince: Date | null; amountMinor: number | null; unpaidMinor: number | null }[]
     >`
       -- Début de l'occupation (spec 006, R2 et R4) : plus ancienne session ouverte,
       -- ou plus ancienne demande encore en cours si le client s'est déconnecté entre-temps.
@@ -165,7 +171,12 @@ export class FloorService {
           SELECT coalesce(sum(r."totalMinor"), 0)::int FROM "ServiceRequest" r
           WHERE r."tableId" = t.id AND r."establishmentId" = t."establishmentId"
             AND r."totalMinor" IS NOT NULL AND r.status <> 'cancelled' AND r."createdAt" >= o.since
-        ) END AS "amountMinor"
+        ) END AS "amountMinor",
+        CASE WHEN o.since IS NULL THEN NULL ELSE (
+          SELECT coalesce(sum(r."totalMinor"), 0)::int FROM "ServiceRequest" r
+          WHERE r."tableId" = t.id AND r."establishmentId" = t."establishmentId"
+            AND r."totalMinor" IS NOT NULL AND r.status = 'resolved' AND r."paidAt" IS NULL AND r."createdAt" >= o.since
+        ) END AS "unpaidMinor"
       FROM "DiningTable" t
       JOIN "DiningArea" a ON a.id = t."areaId" AND a."archivedAt" IS NULL
       LEFT JOIN open_since o ON o."tableId" = t.id
@@ -185,6 +196,7 @@ export class FloorService {
         areaName: row.areaName,
         status: row.occupiedSince ? 'occupied' : 'free',
         amountMinor: row.occupiedSince ? row.amountMinor : null,
+        unpaidMinor: row.occupiedSince ? row.unpaidMinor : null,
       })),
     };
   }
@@ -219,7 +231,7 @@ export class FloorService {
         FROM "Establishment" est
         WHERE est.id = ${scope.establishmentId}::uuid AND est."tenantId" = ${scope.tenantId}::uuid`;
       const last = row?.last && row.last >= row.dayStart ? row.last.toISOString() : null;
-      return { tableId, currency, occupiedSince: null, openSessions: 0, amountMinor: null, lastOccupiedAt: last, orders: [] };
+      return { tableId, currency, occupiedSince: null, openSessions: 0, amountMinor: null, unpaidMinor: null, lastOccupiedAt: last, orders: [] };
     }
 
     const requests = await this.prisma.serviceRequest.findMany({
@@ -227,7 +239,7 @@ export class FloorService {
       orderBy: { createdAt: 'desc' },
       take: 50,
       select: {
-        id: true, status: true, createdAt: true, resolvedAt: true, totalMinor: true, note: true,
+        id: true, status: true, createdAt: true, resolvedAt: true, paidAt: true, totalMinor: true, note: true,
         items: { select: { menuItemId: true, name: true, quantity: true, unitPriceMinor: true }, orderBy: { name: 'asc' } },
       },
     });
@@ -241,12 +253,14 @@ export class FloorService {
       occupiedSince: since.toISOString(),
       openSessions: sessions.length,
       amountMinor: requests.filter((request) => request.status !== 'cancelled').reduce((sum, request) => sum + (request.totalMinor ?? 0), 0),
+      unpaidMinor: requests.filter((request) => request.status === 'resolved' && !request.paidAt).reduce((sum, request) => sum + (request.totalMinor ?? 0), 0),
       lastOccupiedAt: null,
       orders: requests.map((request) => ({
         id: request.id,
         status: request.status,
         createdAt: request.createdAt.toISOString(),
         resolvedAt: request.resolvedAt?.toISOString() ?? null,
+        paidAt: request.paidAt?.toISOString() ?? null,
         totalMinor: request.totalMinor ?? 0,
         note: request.note,
         items: request.items.map((item) => ({ ...item, imageId: images.get(item.menuItemId) ?? null })),

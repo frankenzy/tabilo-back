@@ -47,6 +47,8 @@ export interface RequestView {
   resolvedAt: string | null;
   cancelledAt: string | null;
   escalatedAt: string | null;
+  /** Spec 026 : commande servie réglée ; null = à régler (ou pas encore servie). */
+  paidAt: string | null;
 }
 
 const iso = (date: Date | null): string | null => (date ? date.toISOString() : null);
@@ -76,6 +78,7 @@ export function toRequestView(request: RequestWithRelations): RequestView {
     resolvedAt: iso(request.resolvedAt),
     cancelledAt: iso(request.cancelledAt),
     escalatedAt: iso(request.escalatedAt),
+    paidAt: iso(request.paidAt),
   };
 }
 
@@ -97,6 +100,8 @@ export interface GuestRequestView {
   startedAt: string | null;
   resolvedAt: string | null;
   cancelledAt: string | null;
+  /** Spec 026, R8 : commande réglée. */
+  paidAt: string | null;
 }
 
 export function toGuestRequestView(request: RequestWithRelations): GuestRequestView {
@@ -115,5 +120,6 @@ export function toGuestRequestView(request: RequestWithRelations): GuestRequestV
     startedAt: iso(request.startedAt),
     resolvedAt: iso(request.resolvedAt),
     cancelledAt: iso(request.cancelledAt),
+    paidAt: iso(request.paidAt),
   };
 }

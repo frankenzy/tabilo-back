@@ -65,6 +65,16 @@ export interface SalesFigures {
   passages: number;
   /** Moyenne par passage à table ; null sans passage (spec 009, R4). */
   averageMinor: number | null;
+  /** Spec 026, R7 : commandes réglées pendant la période, datées de leur règlement. */
+  paidMinor: number;
+  paidOrders: number;
+}
+
+/** Spec 026, R7 : commandes servies non réglées, toutes dates confondues. */
+export interface Outstanding {
+  amountMinor: number;
+  orders: number;
+  tables: number;
 }
 
 export interface SalesOverview {
@@ -75,6 +85,7 @@ export interface SalesOverview {
   current: SalesFigures;
   /** Même durée, un mois ou un an plus tôt (R5). */
   previous: SalesFigures;
+  outstanding: Outstanding;
 }
 
 export const TIMELINE_BUCKETS = ['month', 'day', 'hour'] as const;
@@ -480,7 +491,12 @@ export class AnalyticsService {
     const unit = period === 'month' ? '1 month' : '1 year';
     const trunc = Prisma.raw(`'${period}'`);
     const [row] = await this.prisma.$queryRaw<
-      { currency: string; from: string; totals: { shift: number; totalMinor: number; orders: number; passages: number }[] }[]
+      {
+        currency: string;
+        from: string;
+        totals: { shift: number; totalMinor: number; orders: number; passages: number; paidMinor: number; paidOrders: number }[];
+        outstanding: { amountMinor: number; orders: number; tables: number };
+      }[]
     >`
       WITH est AS (
         SELECT e.currency, e.timezone AS tz, now() AT TIME ZONE e.timezone AS local_now
@@ -508,22 +524,36 @@ export class AnalyticsService {
           SELECT g.shift,
             coalesce(sum(sv."totalMinor"), 0)::bigint::float8 AS "totalMinor",
             count(sv."totalMinor")::int AS orders,
-            coalesce(sum(sv.opens), 0)::int AS passages
+            coalesce(sum(sv.opens), 0)::int AS passages,
+            (SELECT coalesce(sum(r."totalMinor"), 0)::bigint::float8 FROM "ServiceRequest" r
+              WHERE ${this.scopeSql(scope)} AND r."totalMinor" IS NOT NULL AND r."paidAt" >= g.start AND r."paidAt" < g.stop) AS "paidMinor",
+            (SELECT count(*)::int FROM "ServiceRequest" r
+              WHERE ${this.scopeSql(scope)} AND r."totalMinor" IS NOT NULL AND r."paidAt" >= g.start AND r."paidAt" < g.stop) AS "paidOrders"
           FROM ranges g LEFT JOIN served sv ON sv.shift = g.shift
-          GROUP BY g.shift
-        ) t) AS totals
+          GROUP BY g.shift, g.start, g.stop
+        ) t) AS totals,
+        -- Spec 026 : reste à encaisser, toutes dates.
+        (SELECT json_build_object(
+            'amountMinor', coalesce(sum(r."totalMinor"), 0)::bigint::float8,
+            'orders', count(*)::int,
+            'tables', count(DISTINCT r."tableId")::int)
+          FROM "ServiceRequest" r
+          WHERE ${this.scopeSql(scope)} AND r.status = 'resolved' AND r."totalMinor" IS NOT NULL AND r."paidAt" IS NULL) AS outstanding
       FROM est`;
     if (!row) throw unprocessable('ESTABLISHMENT_NOT_FOUND', 'Établissement introuvable.');
     const figures = (shift: number): SalesFigures => {
-      const t = row.totals.find((x) => x.shift === shift) ?? { totalMinor: 0, orders: 0, passages: 0 };
+      const t = row.totals.find((x) => x.shift === shift) ?? { totalMinor: 0, orders: 0, passages: 0, paidMinor: 0, paidOrders: 0 };
       return {
         totalMinor: Math.round(t.totalMinor),
         orders: t.orders,
         passages: t.passages,
         averageMinor: t.passages > 0 ? Math.round(t.totalMinor / t.passages) : null,
+        paidMinor: Math.round(t.paidMinor),
+        paidOrders: t.paidOrders,
       };
     };
-    return { currency: row.currency, period, from: row.from, current: figures(0), previous: figures(1) };
+    const outstanding = { amountMinor: Math.round(row.outstanding.amountMinor), orders: row.outstanding.orders, tables: row.outstanding.tables };
+    return { currency: row.currency, period, from: row.from, current: figures(0), previous: figures(1), outstanding };
   }
 
   private scopeSql(scope: Scope): Prisma.Sql {

@@ -14,6 +14,8 @@ export type DomainEventType =
   | 'request.released'
   | 'request.escalated'
   | 'request.escalation_acknowledged'
+  /** Spec 026 : commande servie réglée. */
+  | 'request.paid'
   | 'session.closed';
 
 export interface DomainEventPayload {

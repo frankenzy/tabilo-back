@@ -363,6 +363,8 @@ model ServiceRequest {
   resolvedAt       DateTime?        @db.Timestamptz(3)
   cancelledAt      DateTime?        @db.Timestamptz(3)
   escalatedAt      DateTime?        @db.Timestamptz(3)
+  /// Spec 026 : commande servie réglée par le client. Axe distinct du statut ; NULL = à régler.
+  paidAt           DateTime?        @db.Timestamptz(3)
 
   establishment Establishment       @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
   table         DiningTable         @relation(fields: [tableId, establishmentId], references: [id, establishmentId], onDelete: Restrict)

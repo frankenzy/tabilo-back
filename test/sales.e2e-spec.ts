@@ -89,7 +89,7 @@ describe('Spec 009 — ventes du tableau de bord', () => {
     await order('A', 2000, 'served', at(noon, 1));
     await order('A', 4000, 'served', at(noon, 7));
     const { current } = await sales();
-    expect(current).toEqual({ totalMinor: 9000, orders: 3, passages: 2, averageMinor: 4500 });
+    expect(current).toMatchObject({ totalMinor: 9000, orders: 3, passages: 2, averageMinor: 4500 });
   });
 
   it('CA-009-03 — comparaison avec la même durée du mois précédent', async () => {

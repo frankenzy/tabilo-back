@@ -8,6 +8,7 @@ import {
   ListRequestsQuery,
   OptionalReasonDto,
   ReasonDto,
+  SettleTableDto,
 } from './dto';
 import { ServiceRequestsService } from './service-requests.service';
 
@@ -29,6 +30,14 @@ export class ServiceRequestsController {
   @ApiOperation({ summary: 'Créer une demande pour une table (client sans smartphone)' })
   create(@CurrentScope() scope: Scope, @Body() dto: CreateStaffRequestDto) {
     return this.requests.createByStaff(scope, dto);
+  }
+
+  @Post('settle-table')
+  @HttpCode(200)
+  @RequirePermissions('requests.handle')
+  @ApiOperation({ summary: "Régler les commandes servies non réglées de l'occupation d'une table (spec 026)" })
+  settleTable(@CurrentScope() scope: Scope, @Body() dto: SettleTableDto) {
+    return this.requests.settleTable(scope, dto.tableId);
   }
 
   @Get(':id')
@@ -73,6 +82,14 @@ export class ServiceRequestsController {
   @RequirePermissions('requests.handle')
   resolve(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string) {
     return this.requests.resolve(scope, id);
+  }
+
+  @Post(':id/settle')
+  @HttpCode(200)
+  @RequirePermissions('requests.handle')
+  @ApiOperation({ summary: 'Régler une commande servie (spec 026)' })
+  settle(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string) {
+    return this.requests.settle(scope, id);
   }
 
   @Post(':id/release')

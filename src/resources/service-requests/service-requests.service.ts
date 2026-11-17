@@ -94,7 +94,12 @@ export class ServiceRequestsService {
       assigneeId: query.assigneeId,
     };
     if (query.status) where.status = query.status;
-    else if (query.scope === 'active') where.status = { in: [...ACTIVE_STATUSES] };
+    else if (query.scope === 'unpaid') {
+      // Spec 026 : commandes servies non réglées.
+      where.status = 'resolved';
+      where.totalMinor = { not: null };
+      where.paidAt = null;
+    } else if (query.scope === 'active') where.status = { in: [...ACTIVE_STATUSES] };
     else if (query.scope === 'closed') where.status = { in: [...TERMINAL_STATUSES] };
     if (query.late) {
       where.acceptedAt = null;
@@ -108,7 +113,7 @@ export class ServiceRequestsService {
       this.prisma.serviceRequest.findMany({
         where,
         include: REQUEST_INCLUDE,
-        orderBy: { createdAt: query.scope === 'active' && !query.status ? 'asc' : 'desc' },
+        orderBy: { createdAt: (query.scope === 'active' || query.scope === 'unpaid') && !query.status ? 'asc' : 'desc' },
         ...skipTake(query),
       }),
       this.prisma.serviceRequest.count({ where }),
@@ -390,6 +395,52 @@ export class ServiceRequestsService {
     });
   }
 
+  /** Spec 026, R1 : régler une commande servie. Une seule personne réussit si deux règlent en même temps. */
+  async settle(scope: Scope, id: string): Promise<RequestView> {
+    return this.mutate(scope, id, async (tx, current) => {
+      if (current.totalMinor === null) throw unprocessable('NOT_AN_ORDER', 'Seule une commande se règle.');
+      if (current.status !== 'resolved') {
+        throw conflict('NOT_SERVED', `Action impossible : la commande est ${STATUS_LABELS[current.status]}, pas encore servie.`);
+      }
+      if (!(await this.markPaid(tx, current, staffActor(scope)))) throw conflict('ALREADY_PAID', 'Déjà réglée.');
+    });
+  }
+
+  /**
+   * Spec 026, R4 : régler toutes les commandes servies non réglées de l'occupation en cours d'une table.
+   * Début de l'occupation : même règle que la fiche de table (spec 020) — plus ancienne session ouverte
+   * ou plus ancienne demande encore en cours. Les commandes réglées ou non servies ne changent pas.
+   */
+  async settleTable(scope: Scope, tableId: string): Promise<{ settled: number; amountMinor: number }> {
+    const result = await this.prisma.$transaction(async (tx) => {
+      const where = { tenantId: scope.tenantId, establishmentId: scope.establishmentId, tableId };
+      const table = await tx.diningTable.findFirst({ where: { id: tableId, tenantId: scope.tenantId, establishmentId: scope.establishmentId, archivedAt: null } });
+      if (!table) throw notFound('TABLE_NOT_FOUND', 'Table introuvable.');
+      const now = new Date();
+      const [session, active] = await Promise.all([
+        tx.tableSession.findFirst({ where: { ...where, status: 'open', expiresAt: { gt: now } }, orderBy: { openedAt: 'asc' }, select: { openedAt: true } }),
+        tx.serviceRequest.findFirst({ where: { ...where, status: { in: [...ACTIVE_STATUSES] } }, orderBy: { createdAt: 'asc' }, select: { createdAt: true } }),
+      ]);
+      const starts = [session?.openedAt, active?.createdAt].filter((date): date is Date => !!date).map((date) => date.getTime());
+      if (starts.length === 0) throw conflict('NOTHING_TO_SETTLE', 'La table est libre : rien à régler.');
+      const unpaid = await tx.serviceRequest.findMany({
+        where: { ...where, status: 'resolved', totalMinor: { not: null }, paidAt: null, createdAt: { gte: new Date(Math.min(...starts)) } },
+      });
+      if (unpaid.length === 0) throw conflict('NOTHING_TO_SETTLE', 'Rien à régler sur cette table.');
+      let settled = 0;
+      let amountMinor = 0;
+      for (const request of unpaid) {
+        if (await this.markPaid(tx, request, staffActor(scope))) {
+          settled += 1;
+          amountMinor += request.totalMinor ?? 0;
+        }
+      }
+      return { settled, amountMinor };
+    });
+    this.outbox.kick();
+    return result;
+  }
+
   async cancel(scope: Scope, id: string, reason?: string): Promise<RequestView> {
     return this.mutate(scope, id, async (tx, current) => {
       await this.step(tx, current, 'cancelled', { cancelledAt: new Date() }, {
@@ -574,6 +625,28 @@ export class ServiceRequestsService {
       });
     }
     return tx.serviceRequest.findUniqueOrThrow({ where: { id: current.id } });
+  }
+
+  /** Spec 026 : marque une commande servie réglée ; false si elle l'était déjà (ou a changé entre-temps). */
+  private async markPaid(tx: Tx, request: ServiceRequest, actor: Actor): Promise<boolean> {
+    const updated = await tx.serviceRequest.updateMany({
+      where: { id: request.id, establishmentId: request.establishmentId, status: 'resolved', paidAt: null },
+      data: { paidAt: new Date(), version: { increment: 1 } },
+    });
+    if (updated.count !== 1) return false;
+    await tx.serviceRequestEvent.create({
+      data: {
+        tenantId: request.tenantId,
+        establishmentId: request.establishmentId,
+        requestId: request.id,
+        type: 'request.paid',
+        actorType: actor.type,
+        actorId: actor.id,
+        payload: { amountMinor: request.totalMinor },
+      },
+    });
+    await this.outbox.add(tx, request, 'request.paid', { requestId: request.id, actorId: actor.id });
+    return true;
   }
 
   private async stepAssign(
