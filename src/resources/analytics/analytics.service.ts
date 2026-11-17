@@ -440,7 +440,8 @@ export class AnalyticsService {
           count(*) FILTER (WHERE r.status = 'cancelled')::int AS cancelled
         FROM "ServiceRequest" r, range
         WHERE ${this.scopeSql(scope)}
-          AND r."createdAt" AT TIME ZONE ${ctx.tz} >= range.start AND r."createdAt" AT TIME ZONE ${ctx.tz} < range.stop
+          -- Bornes converties dans le fuseau, pas la colonne : l'index (établissement, createdAt) reste utilisable.
+          AND r."createdAt" >= range.start AT TIME ZONE ${ctx.tz} AND r."createdAt" < range.stop AT TIME ZONE ${ctx.tz}
         GROUP BY 1
       )
       SELECT to_char(p.period, 'YYYY-MM-DD"T"HH24:00') AS period,
@@ -468,8 +469,8 @@ export class AnalyticsService {
         ${average('resolvedAt')} AS "averageResolveSeconds"
       FROM "ServiceRequest" r
       WHERE ${this.scopeSql(scope)}
-        AND r."createdAt" AT TIME ZONE ${ctx.tz} >= ${startText}::timestamp
-        AND r."createdAt" AT TIME ZONE ${ctx.tz} < ${startText}::timestamp + ${span}::interval`;
+        AND r."createdAt" >= ${startText}::timestamp AT TIME ZONE ${ctx.tz}
+        AND r."createdAt" < (${startText}::timestamp + ${span}::interval) AT TIME ZONE ${ctx.tz}`;
 
     let result = points;
     if (query.bucket === 'hour') {
