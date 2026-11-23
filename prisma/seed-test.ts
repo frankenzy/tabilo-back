@@ -11,7 +11,7 @@
  *
  * À lancer sur une base vide (après `prisma migrate reset`) :
  *
- *   SEED_PASSWORD='un-mot-de-passe-solide' npm run seed:test
+ *   SEED_PASSWORD='un-mot-de-passe-solide' pnpm seed:test
  */
 import { PrismaClient } from '@prisma/client';
 import * as argon2 from 'argon2';
@@ -200,7 +200,7 @@ async function main(): Promise<void> {
   if (process.env.NODE_ENV === 'production') throw new Error('Le jeu de test est interdit en production.');
   const password = process.env.SEED_PASSWORD;
   if (!password || password.length < 10) throw new Error('Définissez SEED_PASSWORD (10 caractères au minimum).');
-  if ((await prisma.tenant.count()) > 0) throw new Error('La base n’est pas vide : lancez d’abord « npx prisma migrate reset ».');
+  if ((await prisma.tenant.count()) > 0) throw new Error('La base n’est pas vide : lancez d’abord « pnpm exec prisma migrate reset ».');
 
   const mock = readMock();
   const catalogue = [...mock.plats, ...mock.boissons];

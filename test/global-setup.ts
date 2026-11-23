@@ -18,7 +18,7 @@ export default async function globalSetup(): Promise<void> {
   await client.$executeRawUnsafe(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`);
   await client.$executeRawUnsafe(`CREATE DATABASE "${database}"`);
   await client.$disconnect();
-  execSync('npx prisma migrate deploy', {
+  execSync('pnpm exec prisma migrate deploy', {
     cwd: `${__dirname}/..`,
     env: { ...process.env, DATABASE_URL: TEST_DATABASE_URL },
     stdio: 'pipe',

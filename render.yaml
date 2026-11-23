@@ -11,7 +11,7 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     # Pas de « pre-deploy » sur l'offre gratuite : les migrations passent au démarrage.
-    dockerCommand: sh -c "npx prisma migrate deploy && node dist/main.js"
+    dockerCommand: sh -c "./node_modules/.bin/prisma migrate deploy && node dist/main.js"
     healthCheckPath: /api/v1/health/live
     autoDeploy: true
     envVars:

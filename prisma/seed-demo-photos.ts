@@ -4,7 +4,7 @@
  * Seuls les articles et rubriques sans photo, dont le nom figure dans le jeu de démonstration,
  * sont complétés. Jamais en production.
  *
- *   npm run seed:demo-photos -- "Le Maquis (démo)" "DEMO"
+ *   pnpm seed:demo-photos "Le Maquis (démo)" "DEMO"
  */
 import { PrismaClient } from '@prisma/client';
 import { demoPhoto } from './demo-images';

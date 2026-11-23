@@ -1,6 +1,6 @@
 # Photos de démonstration — crédits
 
-Photos de la carte de démonstration (`npm run seed:demo`, `npm run seed:demo-photos`). Toutes proviennent de Wikimedia Commons, sous licence libre. Elles ont été recadrées au carré et réduites à 800 px (« modifiées » au sens des licences CC BY-SA, qui restent celles d'origine).
+Photos de la carte de démonstration (`pnpm seed:demo`, `pnpm seed:demo-photos`). Toutes proviennent de Wikimedia Commons, sous licence libre. Elles ont été recadrées au carré et réduites à 800 px (« modifiées » au sens des licences CC BY-SA, qui restent celles d'origine).
 
 Réservées à la démonstration et aux tests : elles ne sont jamais servies à un vrai établissement.
 

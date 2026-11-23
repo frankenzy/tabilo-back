@@ -4,7 +4,7 @@
  * Crée un tenant « Démo TABILO » avec un établissement, une équipe, des tables, une carte et une
  * semaine de demandes et de commandes fictives, pour découvrir l'interface. Tout y est identifié comme démonstration.
  *
- *   DEMO_PASSWORD='un-mot-de-passe-solide' npm run seed:demo
+ *   DEMO_PASSWORD='un-mot-de-passe-solide' pnpm seed:demo
  *
  * Relancer le script remplace le précédent tenant de démonstration.
  */

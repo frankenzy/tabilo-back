@@ -79,8 +79,8 @@ Depuis le poste, avec la chaîne Neon :
 
 ```bash
 cd backend
-DATABASE_URL='<chaîne Neon>' npm run seed:demo
-DATABASE_URL='<chaîne Neon>' npm run seed:demo-photos
+DATABASE_URL='<chaîne Neon>' pnpm seed:demo
+DATABASE_URL='<chaîne Neon>' pnpm seed:demo-photos
 ```
 
 ## Limites connues
