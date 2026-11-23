@@ -2,7 +2,7 @@ import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { JwtService } from '@nestjs/jwt';
 import { isUUID } from 'class-validator';
-import { effectivePermissions, isPermissionKey, PermissionKey } from '../constants/permissions';
+import { effectivePermissions, PermissionKey } from '../constants/permissions';
 import { IS_PUBLIC, REQUIRED_PERMISSIONS } from '../decorators';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../services/audit.service';
