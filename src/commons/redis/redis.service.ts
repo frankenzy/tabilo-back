@@ -34,7 +34,7 @@ export class RedisService implements OnModuleDestroy {
   }
 
   /** Options de connexion pour BullMQ, qui gère ses propres connexions. */
-  connectionOptions(): { host: string; port: number; password?: string; username?: string; db?: number } {
+  connectionOptions(): { host: string; port: number; password?: string; username?: string; db?: number; tls?: object } {
     const url = new URL(this.env.redisUrl);
     return {
       host: url.hostname,
@@ -42,6 +42,8 @@ export class RedisService implements OnModuleDestroy {
       username: url.username || undefined,
       password: url.password || undefined,
       db: url.pathname.length > 1 ? Number(url.pathname.slice(1)) : undefined,
+      // Redis hébergé (Redis Cloud, Upstash) : URL en rediss://, connexion chiffrée.
+      tls: url.protocol === 'rediss:' ? {} : undefined,
     };
   }
 
