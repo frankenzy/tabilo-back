@@ -1,0 +1,38 @@
+# Blueprint Render — API TABILO sur l'offre gratuite (démonstrations, prospection).
+# Guide complet : DEPLOIEMENT_GRATUIT.md (dépôt de l'API)
+# Une seule instance fait API + worker (WORKER_ENABLED=true) : l'offre gratuite n'a pas de worker séparé.
+services:
+  - type: web
+    name: tabilo-api
+    runtime: docker
+    plan: free
+    region: frankfurt
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Pas de « pre-deploy » sur l'offre gratuite : les migrations passent au démarrage.
+    dockerCommand: sh -c "npx prisma migrate deploy && node dist/main.js"
+    healthCheckPath: /api/v1/health/live
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_PORT
+        value: "10000"
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: SWAGGER_ENABLED
+        value: "false"
+      - key: WORKER_ENABLED
+        value: "true"
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      # À saisir dans le tableau de bord Render à la création :
+      - key: DATABASE_URL # Neon, chaîne « directe » (sans -pooler) pour prisma migrate
+        sync: false
+      - key: REDIS_URL # Redis Cloud : redis://default:<mot-de-passe>@<hôte>:<port>
+        sync: false
+      - key: CORS_ORIGINS # https://<projet>.vercel.app
+        sync: false
+      - key: PUBLIC_WEB_URL # https://<projet>.vercel.app (adresse des QR codes)
+        sync: false
