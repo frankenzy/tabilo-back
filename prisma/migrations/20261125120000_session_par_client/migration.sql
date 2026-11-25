@@ -62,9 +62,6 @@ ALTER TABLE "UnpaidAlert" ADD CONSTRAINT "UnpaidAlert_establishmentId_fkey" FORE
 ALTER TABLE "UnpaidAlert" ADD CONSTRAINT "UnpaidAlert_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "TableSession"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 
--- R2 : deux sessions ouvertes d'une même table n'ont jamais le même repère, même en cas de scans simultanés.
-CREATE UNIQUE INDEX "TableSession_open_marker_key" ON "TableSession"("tableId", "markerIndex") WHERE status = 'open';
-
 -- R9 : une seule alerte ouverte par session.
 CREATE UNIQUE INDEX "UnpaidAlert_open_session_key" ON "UnpaidAlert"("sessionId") WHERE "resolvedAt" IS NULL;
 
@@ -81,6 +78,10 @@ FROM (
   FROM "TableSession" WHERE status = 'open'
 ) r
 WHERE s.id = r.id;
+
+-- R2 : deux sessions ouvertes d'une même table n'ont jamais le même repère, même en cas de scans simultanés.
+-- Créé APRÈS la reprise des repères : avant, toutes les sessions ouvertes valent 0 et l'index serait refusé.
+CREATE UNIQUE INDEX "TableSession_open_marker_key" ON "TableSession"("tableId", "markerIndex") WHERE status = 'open';
 
 -- R6 : « L'addition » (type par défaut, icône receipt) se demande par session.
 UPDATE "RequestType" SET "perSession" = true WHERE kind = 'service' AND icon = 'receipt';
