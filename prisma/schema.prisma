@@ -98,6 +98,8 @@ enum RequestTypeKind {
   service
   /// Commande passée depuis la carte. Un seul type de ce genre par établissement.
   order
+  /// Spec 028 : « L'addition », demande de facture d'un client. Un seul type de ce genre par établissement.
+  bill
 }
 
 enum EscalationTrigger {

@@ -1,4 +1,5 @@
-import { Prisma } from '@prisma/client';
+import { Prisma, RequestTypeKind } from '@prisma/client';
+import type { BillSummary } from './bill';
 
 /** Projection chargée pour toute vue d'une demande. */
 export const REQUEST_INCLUDE = {
@@ -33,7 +34,7 @@ export interface RequestView {
   quantity: number | null;
   table: { id: string; label: string };
   area: { id: string; name: string };
-  type: { id: string; label: string; icon: string; kind: 'service' | 'order' };
+  type: { id: string; label: string; icon: string; kind: RequestTypeKind };
   /** Lignes d'une commande (vide pour une demande de service). */
   items: OrderLineView[];
   /** Total d'une commande en unité mineure de la devise, sinon null. */
@@ -57,11 +58,13 @@ export interface RequestView {
   zone: { status: 'inside' | 'outside' | 'imprecise' | 'denied'; distanceM: number | null } | null;
   /** Spec 027, R9 : marquée « Parti sans payer ». */
   writtenOffAt: string | null;
+  /** Spec 028, R5 : demande d'addition — montant dû du client et commandes pas encore comptées ; null sinon. */
+  bill: BillSummary | null;
 }
 
 const iso = (date: Date | null): string | null => (date ? date.toISOString() : null);
 
-export function toRequestView(request: RequestWithRelations): RequestView {
+export function toRequestView(request: RequestWithRelations, bill?: BillSummary): RequestView {
   return {
     id: request.id,
     status: request.status,
@@ -90,6 +93,7 @@ export function toRequestView(request: RequestWithRelations): RequestView {
     marker: request.session?.markerIndex ?? null,
     zone: request.zoneCheck ? { status: request.zoneCheck, distanceM: request.zoneDistanceM } : null,
     writtenOffAt: iso(request.writtenOffAt),
+    bill: request.requestType.kind === 'bill' ? (bill ?? { dueMinor: 0, pendingOrders: 0 }) : null,
   };
 }
 
@@ -104,7 +108,7 @@ function typeOf(request: RequestWithRelations): RequestView['type'] {
  * ou une demande propre au client (« L'addition ») ; les autres demandes de service restent communes à la table.
  */
 export function isPerSession(request: RequestWithRelations): boolean {
-  return request.sessionId !== null && (request.requestType.kind === 'order' || request.requestType.perSession);
+  return request.sessionId !== null && (request.requestType.kind !== 'service' || request.requestType.perSession);
 }
 
 /**
@@ -115,7 +119,7 @@ export function isPerSession(request: RequestWithRelations): boolean {
 export interface GuestRequestView {
   id: string;
   status: RequestWithRelations['status'];
-  type: { id: string; label: string; icon: string; kind: 'service' | 'order' };
+  type: { id: string; label: string; icon: string; kind: RequestTypeKind };
   items: OrderLineView[];
   totalMinor: number | null;
   quantity: number | null;
