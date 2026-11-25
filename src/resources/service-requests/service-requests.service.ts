@@ -174,7 +174,8 @@ export class ServiceRequestsService {
         select: { id: true, areaId: true },
       });
       if (!table) throw notFound('TABLE_NOT_FOUND', 'Table introuvable.');
-      const type = await this.loadServiceType(tx, scope.establishmentId, dto.requestTypeId);
+      // Spec 029 : le personnel peut aussi saisir un appel pour une table.
+      const type = await this.loadServiceType(tx, scope.establishmentId, dto.requestTypeId, ['service', 'call']);
       const created = await this.insert(tx, {
         scope,
         table,
@@ -231,8 +232,12 @@ export class ServiceRequestsService {
       let type: Awaited<ReturnType<ServiceRequestsService['loadServiceType']>>;
       let lines: ResolvedLine[] = [];
       if (input.kind === 'service') {
-        type = await this.loadServiceType(tx, guest.establishmentId, input.requestTypeId, ['service', 'bill']);
+        type = await this.loadServiceType(tx, guest.establishmentId, input.requestTypeId, ['service', 'bill', 'call', 'message']);
         const perClient = type.perSession || type.kind === 'bill';
+        // Spec 029, R5 : un message porte un texte ; chaque envoi est un message à part, sans dédoublonnage.
+        if (type.kind === 'message' && !input.note?.trim()) {
+          throw unprocessable('MESSAGE_REQUIRED', 'Écrivez votre message.');
+        }
         // Une seule demande active par table et par type : un second appui renvoie l'existante.
         // Spec 027, R6 et spec 028, R1 : par client pour une demande propre à chacun (« L'addition »).
         const duplicate = await tx.serviceRequest.findFirst({
@@ -244,7 +249,7 @@ export class ServiceRequestsService {
           },
           select: { id: true },
         });
-        if (duplicate) return { id: duplicate.id, deduplicated: true };
+        if (duplicate && type.kind !== 'message') return { id: duplicate.id, deduplicated: true };
         // Spec 028, R2 : l'addition ne se demande que s'il y a quelque chose à régler.
         if (type.kind === 'bill') {
           const summary = (await billSummaries(tx, [guest.id])).get(guest.id);
@@ -286,7 +291,7 @@ export class ServiceRequestsService {
         scope: { tenantId: guest.tenantId, establishmentId: guest.establishmentId },
         table,
         type,
-        note: type.allowNote ? input.note : undefined,
+        note: type.allowNote || type.kind === 'message' ? input.note : undefined,
         quantity: input.kind === 'service' ? input.quantity : undefined,
         lines,
         source: 'customer',
@@ -323,7 +328,8 @@ export class ServiceRequestsService {
         establishmentId: guest.establishmentId,
         OR: [
           { sessionId: guest.id },
-          { status: { in: [...ACTIVE_STATUSES] }, requestType: { kind: 'service', perSession: false } },
+          // Spec 029, R3 : l'appel est commun à la table, comme les demandes de service.
+          { status: { in: [...ACTIVE_STATUSES] }, requestType: { kind: { in: ['service', 'call'] }, perSession: false } },
         ],
       },
       include: REQUEST_INCLUDE,
@@ -336,7 +342,16 @@ export class ServiceRequestsService {
 
   async cancelByGuest(guest: GuestSession, id: string): Promise<GuestRequestView> {
     await this.prisma.$transaction(async (tx) => {
-      const current = await tx.serviceRequest.findFirst({ where: { id, sessionId: guest.id } });
+      // Spec 029, R4 : l'appel est commun à la table, chacun de ses téléphones peut raccrocher.
+      const current = await tx.serviceRequest.findFirst({
+        where: {
+          id,
+          OR: [
+            { sessionId: guest.id },
+            { tableId: guest.tableId, establishmentId: guest.establishmentId, requestType: { kind: 'call' } },
+          ],
+        },
+      });
       if (!current) throw this.requestNotFound();
       if (current.status !== 'pending') {
         throw conflict('REQUEST_ALREADY_HANDLED', 'Cette demande est déjà prise en charge.');
@@ -387,7 +402,13 @@ export class ServiceRequestsService {
    */
   async prepare(scope: Scope, id: string): Promise<RequestView> {
     return this.mutate(scope, id, async (tx, current) => {
-      if (current.totalMinor === null) throw unprocessable('NOT_AN_ORDER', "Seule une commande se prépare depuis l'écran « Commandes ».");
+      if (current.totalMinor === null) {
+        // Spec 029, R7 : « J'y vais » prend un appel ou un message de la même façon.
+        const type = await tx.requestType.findUnique({ where: { id: current.requestTypeId }, select: { kind: true } });
+        if (type?.kind !== 'call' && type?.kind !== 'message') {
+          throw unprocessable('NOT_AN_ORDER', "Seule une commande se prépare depuis l'écran « Commandes ».");
+        }
+      }
       const takenByOther = current.assigneeId !== null && current.assigneeId !== scope.userId;
       if (takenByOther || !['pending', 'assigned', 'accepted'].includes(current.status)) {
         const holder = current.assigneeId

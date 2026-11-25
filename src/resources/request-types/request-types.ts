@@ -96,6 +96,10 @@ export class RequestTypesService {
     if (type.kind === 'bill') {
       throw conflict('BILL_TYPE_REQUIRED', "La demande « L'addition » ne se supprime pas. Masquez-la pour la suspendre.");
     }
+    // Spec 029, R1 : l'appel et le message sont les deux ronds du bouton « Serveur ».
+    if (type.kind === 'call' || type.kind === 'message') {
+      throw conflict('SERVER_TYPE_REQUIRED', "L'appel et le message ne se suppriment pas. Masquez-les pour les suspendre.");
+    }
     await this.prisma.$transaction(async (tx) => {
       await tx.requestType.update({ where: { id }, data: { archivedAt: new Date(), isActive: false } });
       await this.audit.record({ action: 'request_type.archived', ...this.ctx(scope), entityType: 'RequestType', entityId: id }, tx);
