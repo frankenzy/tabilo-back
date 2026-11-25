@@ -6,6 +6,7 @@ import { PrismaService } from '../commons/prisma/prisma.service';
 import { RedisService } from '../commons/redis/redis.service';
 import { EscalationService } from '../resources/escalation/escalation.service';
 import { DomainEvent, OutboxService } from '../resources/outbox/outbox.service';
+import { closeBillRequests } from '../resources/service-requests/bill';
 import { raiseUnpaidAlerts, UnpaidAlertsService } from '../resources/unpaid-alerts/unpaid-alerts';
 
 const QUEUE = 'tabilo-escalation';
@@ -124,19 +125,24 @@ export class TasksService implements OnModuleInit, OnApplicationShutdown {
   @Interval(60_000)
   async expireSessions(): Promise<void> {
     if (this.skip()) return;
-    await this.guard('sessions', async () => {
-      const now = new Date();
-      const raised = await this.prisma.$transaction(async (tx) => {
-        const expired = await tx.tableSession.findMany({ where: { status: 'open', expiresAt: { lte: now } }, select: { id: true }, take: 500 });
-        if (expired.length === 0) return 0;
-        const ids = expired.map((session) => session.id);
-        // Spec 027, R10 : une session expirée qui laisse un reste à régler déclenche l'alerte.
-        const count = await raiseUnpaidAlerts(tx, this.outbox, ids, 'expired');
-        await tx.tableSession.updateMany({ where: { id: { in: ids }, status: 'open' }, data: { status: 'expired', closedAt: now } });
-        return count;
-      });
-      if (raised > 0) this.outbox.kick();
+    await this.guard('sessions', () => this.expireSessionsNow());
+  }
+
+  /** Expire les sessions arrivées à échéance ; `now` sert aux tests. */
+  async expireSessionsNow(now = new Date()): Promise<void> {
+    const expiredSome = await this.prisma.$transaction(async (tx) => {
+      const expired = await tx.tableSession.findMany({ where: { status: 'open', expiresAt: { lte: now } }, select: { id: true }, take: 500 });
+      if (expired.length === 0) return false;
+      const ids = expired.map((session) => session.id);
+      // Spec 027, R10 : une session expirée qui laisse un reste à régler déclenche l'alerte.
+      await raiseUnpaidAlerts(tx, this.outbox, ids, 'expired');
+      // Spec 028, R6 : une demande d'addition ne survit pas à sa session.
+      await closeBillRequests(tx, this.outbox, ids, 'expired', { type: 'system', id: null });
+      await tx.tableSession.updateMany({ where: { id: { in: ids }, status: 'open' }, data: { status: 'expired', closedAt: now } });
+      return true;
     });
+    // Alertes et clôtures d'addition passent par l'outbox.
+    if (expiredSome) this.outbox.kick();
   }
 
   /** Spec 027, R9 : alertes de départ sans payer après le délai d'inactivité de chaque établissement. */

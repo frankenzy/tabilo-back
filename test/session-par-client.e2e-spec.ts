@@ -311,11 +311,14 @@ describe('Spec 027 — une session par client', () => {
   });
 
   it('R6 — « L’addition » par client, « Appeler un serveur » commun à la table', async () => {
-    const { table } = await shop('Addition par client');
+    const { table, order } = await shop('Addition par client');
     const a = await openSession(t, table.code);
     const b = await openSession(t, table.code);
-    const types = (await t.http.get('/api/v1/guest/session').set(a.headers).expect(200)).body.requestTypes as { id: string; icon: string }[];
-    const bill = types.find((type) => type.icon === 'receipt')!.id;
+    // Spec 028, R2 : l'addition suppose quelque chose à régler.
+    await order(a, 1, 'served');
+    await order(b, 1, 'served');
+    const types = (await t.http.get('/api/v1/guest/session').set(a.headers).expect(200)).body.requestTypes as { id: string; icon: string; kind: string }[];
+    const bill = types.find((type) => type.kind === 'bill')!.id;
     const bell = types.find((type) => type.icon === 'bell')!.id;
     const ask = (guest: Guest, requestTypeId: string) => t.http.post('/api/v1/guest/requests').set(guest.headers).send({ requestTypeId }).expect(200);
     const billA = await ask(a, bill);

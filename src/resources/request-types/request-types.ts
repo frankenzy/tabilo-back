@@ -92,6 +92,10 @@ export class RequestTypesService {
     if (type.kind === 'order') {
       throw conflict('ORDER_TYPE_REQUIRED', 'Le type « Commande » ne se supprime pas. Masquez-le pour suspendre les commandes.');
     }
+    // Spec 028, R1 : la demande d'addition se renomme ou se désactive, elle ne se supprime pas.
+    if (type.kind === 'bill') {
+      throw conflict('BILL_TYPE_REQUIRED', "La demande « L'addition » ne se supprime pas. Masquez-la pour la suspendre.");
+    }
     await this.prisma.$transaction(async (tx) => {
       await tx.requestType.update({ where: { id }, data: { archivedAt: new Date(), isActive: false } });
       await this.audit.record({ action: 'request_type.archived', ...this.ctx(scope), entityType: 'RequestType', entityId: id }, tx);

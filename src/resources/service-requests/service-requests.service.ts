@@ -1,17 +1,19 @@
 import { Injectable } from '@nestjs/common';
-import { ActorType, Prisma, RequestStatus, ServiceRequest } from '@prisma/client';
+import { ActorType, Prisma, RequestStatus, RequestTypeKind, ServiceRequest } from '@prisma/client';
 import { PrismaService, Tx } from '../../commons/prisma/prisma.service';
 import { can, GuestSession, Scope } from '../../commons/types';
 import { conflict, forbidden, notFound, tooMany, unprocessable } from '../../commons/utils/errors';
 import { Page, skipTake, toPage } from '../../commons/utils/pagination';
 import { ClientLocation, evaluateZone, ZoneResult } from '../../commons/utils/zone';
 import { DomainEventType, OutboxService } from '../outbox/outbox.service';
+import { billSummaries, closeBillRequests } from './bill';
 import { AssignRequestDto, CreateStaffRequestDto, ListRequestsQuery } from './dto';
 import { ACTIVE_STATUSES, canTransition, TERMINAL_STATUSES } from './request-lifecycle';
 import {
   GuestRequestView,
   REQUEST_INCLUDE,
   RequestView,
+  RequestWithRelations,
   toGuestRequestView,
   toRequestView,
 } from './request.views';
@@ -127,7 +129,7 @@ export class ServiceRequestsService {
       }),
       this.prisma.serviceRequest.count({ where }),
     ]);
-    return toPage(rows.map(toRequestView), total, query);
+    return toPage(await this.withBills(rows), total, query);
   }
 
   async get(scope: Scope, id: string): Promise<RequestView & { events: RequestEventView[] }> {
@@ -142,8 +144,9 @@ export class ServiceRequestsService {
       select: { id: true, firstName: true, lastName: true },
     });
     const names = new Map(actors.map((a) => [a.id, `${a.firstName} ${a.lastName}`]));
+    const [view] = await this.withBills([request]);
     return {
-      ...toRequestView(request),
+      ...view,
       events: request.events.map((event) => ({
         id: event.id,
         type: event.type,
@@ -228,19 +231,25 @@ export class ServiceRequestsService {
       let type: Awaited<ReturnType<ServiceRequestsService['loadServiceType']>>;
       let lines: ResolvedLine[] = [];
       if (input.kind === 'service') {
-        type = await this.loadServiceType(tx, guest.establishmentId, input.requestTypeId);
+        type = await this.loadServiceType(tx, guest.establishmentId, input.requestTypeId, ['service', 'bill']);
+        const perClient = type.perSession || type.kind === 'bill';
         // Une seule demande active par table et par type : un second appui renvoie l'existante.
-        // Spec 027, R6 : par client pour une demande propre à chacun (« L'addition »).
+        // Spec 027, R6 et spec 028, R1 : par client pour une demande propre à chacun (« L'addition »).
         const duplicate = await tx.serviceRequest.findFirst({
           where: {
             tableId: guest.tableId,
             requestTypeId: type.id,
             status: { in: [...ACTIVE_STATUSES] },
-            ...(type.perSession ? { sessionId: guest.id } : {}),
+            ...(perClient ? { sessionId: guest.id } : {}),
           },
           select: { id: true },
         });
         if (duplicate) return { id: duplicate.id, deduplicated: true };
+        // Spec 028, R2 : l'addition ne se demande que s'il y a quelque chose à régler.
+        if (type.kind === 'bill') {
+          const summary = (await billSummaries(tx, [guest.id])).get(guest.id);
+          if (!summary?.dueMinor) throw unprocessable('NOTHING_TO_PAY', "Rien à régler pour l'instant.");
+        }
       } else {
         // Plusieurs commandes peuvent coexister : pas de dédoublonnage, l'idempotence suffit.
         type = await this.loadOrderType(tx, guest.establishmentId);
@@ -332,6 +341,8 @@ export class ServiceRequestsService {
       if (current.status !== 'pending') {
         throw conflict('REQUEST_ALREADY_HANDLED', 'Cette demande est déjà prise en charge.');
       }
+      // Spec 028 : l'addition demandée se clôt d'elle-même, au règlement ou à la fin de session.
+      await this.assertNotBill(tx, current);
       await this.step(tx, current, 'cancelled', { cancelledAt: new Date() }, {
         eventType: 'request.cancelled',
         actor: { type: 'customer', id: null },
@@ -348,6 +359,7 @@ export class ServiceRequestsService {
   /** Accepter : depuis « en attente » (auto-affectation) ou depuis « affectée » (par son destinataire). */
   async accept(scope: Scope, id: string): Promise<RequestView> {
     return this.mutate(scope, id, async (tx, current) => {
+      await this.assertNotBill(tx, current);
       let request = current;
       if (request.status === 'pending') {
         request = await this.stepAssign(tx, request, scope.userId, staffActor(scope), { silent: true });
@@ -360,6 +372,7 @@ export class ServiceRequestsService {
 
   async start(scope: Scope, id: string): Promise<RequestView> {
     return this.mutate(scope, id, async (tx, current) => {
+      await this.assertNotBill(tx, current);
       this.assertOwnerOrSupervisor(scope, current);
       await this.step(tx, current, 'in_progress', { startedAt: current.startedAt ?? new Date() }, {
         eventType: 'request.started',
@@ -414,6 +427,7 @@ export class ServiceRequestsService {
 
   async resolve(scope: Scope, id: string): Promise<RequestView> {
     return this.mutate(scope, id, async (tx, current) => {
+      await this.assertNotBill(tx, current);
       // Spec 007 : une commande prête est servie par le serveur, qui n'est pas forcément celui qui l'a préparée.
       if (current.status !== 'ready') this.assertOwnerOrSupervisor(scope, current);
       await this.step(tx, current, 'resolved', { resolvedAt: new Date() }, {
@@ -434,6 +448,19 @@ export class ServiceRequestsService {
       if (current.writtenOffAt) throw conflict('WRITTEN_OFF', 'Commande marquée « Parti sans payer ».');
       if (!(await this.markPaid(tx, current, staffActor(scope)))) throw conflict('ALREADY_PAID', 'Déjà réglée.');
       await this.afterPayment(tx, current.sessionId, scope.userId);
+    });
+  }
+
+  /**
+   * Spec 028, R5 : « Glisser pour régler » sur une demande d'addition — règle son client (comme la section « Clients »),
+   * ce qui clôt la demande. Un second règlement ne règle rien de plus.
+   */
+  async settleBill(scope: Scope, id: string): Promise<RequestView> {
+    return this.mutate(scope, id, async (tx, current) => {
+      const type = await tx.requestType.findUnique({ where: { id: current.requestTypeId }, select: { kind: true } });
+      if (type?.kind !== 'bill' || !current.sessionId) throw unprocessable('NOT_A_BILL', "Ce n'est pas une demande d'addition.");
+      const settled = await this.settleSessionTx(tx, current.sessionId, staffActor(scope));
+      if (settled.settled === 0) throw conflict('NOTHING_TO_SETTLE', 'Rien à régler pour ce client.');
     });
   }
 
@@ -536,6 +563,7 @@ export class ServiceRequestsService {
    */
   async assign(scope: Scope, id: string, dto: AssignRequestDto): Promise<RequestView> {
     return this.mutate(scope, id, async (tx, current) => {
+      await this.assertNotBill(tx, current);
       await this.assertAssignable(tx, scope, dto.assigneeId);
       if (current.assigneeId === dto.assigneeId && current.status !== 'pending') {
         throw conflict('ALREADY_ASSIGNED', 'La demande est déjà affectée à cette personne.');
@@ -731,6 +759,8 @@ export class ServiceRequestsService {
       where: { sessionId, status: 'resolved', totalMinor: { not: null }, paidAt: null, writtenOffAt: null },
     });
     if (due === 0) {
+      // Spec 028, R6 : plus rien à régler, la demande d'addition est close.
+      await closeBillRequests(tx, this.outbox, [sessionId], 'settled', { type: actorId ? 'staff' : 'system', id: actorId });
       const open = await tx.unpaidAlert.findMany({ where: { sessionId, resolvedAt: null }, select: { id: true, tenantId: true, establishmentId: true } });
       for (const alert of open) {
         await tx.unpaidAlert.update({ where: { id: alert.id }, data: { resolvedAt: new Date(), resolution: 'paid', resolvedById: actorId } });
@@ -894,10 +924,10 @@ export class ServiceRequestsService {
     return created;
   }
 
-  private async loadServiceType(tx: Tx, establishmentId: string, requestTypeId: string) {
+  private async loadServiceType(tx: Tx, establishmentId: string, requestTypeId: string, kinds: RequestTypeKind[] = ['service']) {
     const type = await tx.requestType.findFirst({
-      where: { id: requestTypeId, establishmentId, kind: 'service', isActive: true, archivedAt: null },
-      select: { id: true, priority: true, slaSeconds: true, allowNote: true, perSession: true },
+      where: { id: requestTypeId, establishmentId, kind: { in: kinds }, isActive: true, archivedAt: null },
+      select: { id: true, kind: true, priority: true, slaSeconds: true, allowNote: true, perSession: true },
     });
     if (!type) throw notFound('REQUEST_TYPE_NOT_FOUND', 'Type de demande indisponible.');
     return type;
@@ -906,7 +936,7 @@ export class ServiceRequestsService {
   private async loadOrderType(tx: Tx, establishmentId: string) {
     const type = await tx.requestType.findFirst({
       where: { establishmentId, kind: 'order', isActive: true, archivedAt: null },
-      select: { id: true, priority: true, slaSeconds: true, allowNote: true, perSession: true },
+      select: { id: true, kind: true, priority: true, slaSeconds: true, allowNote: true, perSession: true },
     });
     if (!type) throw unprocessable('ORDERING_DISABLED', 'La commande en ligne est suspendue. Adressez-vous au personnel.');
     return type;
@@ -989,7 +1019,23 @@ export class ServiceRequestsService {
 
   private async view(id: string): Promise<RequestView> {
     const request = await this.prisma.serviceRequest.findUniqueOrThrow({ where: { id }, include: REQUEST_INCLUDE });
-    return toRequestView(request);
+    const [view] = await this.withBills([request]);
+    return view;
+  }
+
+  /** Spec 028, R5 : une demande d'addition porte le montant dû de son client, en direct. */
+  private async withBills(rows: RequestWithRelations[]): Promise<RequestView[]> {
+    const sessionIds = [...new Set(rows.filter((row) => row.requestType.kind === 'bill' && row.sessionId).map((row) => row.sessionId!))];
+    const bills = await billSummaries(this.prisma, sessionIds);
+    return rows.map((row) => toRequestView(row, row.sessionId ? bills.get(row.sessionId) : undefined));
+  }
+
+  /** Spec 028, R5 : une demande d'addition ne passe ni par « Accepter », ni par « Commencer », ni par « Terminer ». */
+  private async assertNotBill(tx: Tx, request: ServiceRequest): Promise<void> {
+    const type = await tx.requestType.findUnique({ where: { id: request.requestTypeId }, select: { kind: true } });
+    if (type?.kind === 'bill') {
+      throw conflict('BILL_SETTLE_ONLY', "Une demande d'addition se clôt en réglant le client.");
+    }
   }
 
   private requestNotFound() {

@@ -8,6 +8,7 @@ import { AuditService } from '../../commons/services/audit.service';
 import type { Scope } from '../../commons/types';
 import { conflict, notFound } from '../../commons/utils/errors';
 import { OutboxService } from '../outbox/outbox.service';
+import { closeBillRequests } from '../service-requests/bill';
 import { ServiceRequestsModule } from '../service-requests/service-requests.module';
 import { ServiceRequestsService, staffActor } from '../service-requests/service-requests.service';
 
@@ -165,6 +166,8 @@ export class UnpaidAlertsService {
       });
       await this.outbox.add(tx, request, 'request.written_off', { requestId: request.id, actorId: scope.userId });
     }
+    // Spec 028, R6 : « Parti sans payer » clôt la demande d'addition, s'il y en avait une.
+    await closeBillRequests(tx, this.outbox, [sessionId], 'walked_out', { type: 'staff', id: scope.userId });
     await this.requests.endSessionIfDone(tx, sessionId);
   }
 

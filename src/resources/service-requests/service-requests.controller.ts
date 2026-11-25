@@ -101,6 +101,14 @@ export class ServiceRequestsController {
     return this.requests.settle(scope, id);
   }
 
+  @Post(':id/settle-bill')
+  @HttpCode(200)
+  @RequirePermissions('requests.handle')
+  @ApiOperation({ summary: "Régler le client d'une demande d'addition ; la demande se clôt (spec 028)" })
+  settleBill(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string) {
+    return this.requests.settleBill(scope, id);
+  }
+
   @Post(':id/release')
   @HttpCode(200)
   @RequirePermissions('requests.handle')

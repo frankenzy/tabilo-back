@@ -187,7 +187,8 @@ export class GuestService {
     return {
       establishment: { name: establishment.name, currency: establishment.currency },
       table: { label: table.label, area: table.area.name },
-      requestTypes: types.filter((type) => type.kind === 'service').map(({ kind: _kind, ...type }) => type),
+      // Spec 028 : « L'addition » reste parmi les demandes proposées ; `kind` la distingue côté téléphone.
+      requestTypes: types.filter((type) => type.kind !== 'order'),
       menu: categories,
       // La commande n'est proposée que si la carte existe et que le type « Commande » est actif.
       orderingEnabled: categories.length > 0 && types.some((type) => type.kind === 'order'),

@@ -187,7 +187,7 @@ const BRANDS: Brand[] = [
 const REQUEST_TYPES = [
   { label: 'Appeler un serveur', icon: 'bell', slaSeconds: 180, priority: 'normal' as const },
   { label: "De l'eau", icon: 'droplet', slaSeconds: 180, priority: 'normal' as const },
-  { label: "L'addition", icon: 'receipt', slaSeconds: 240, priority: 'normal' as const },
+  { label: "L'addition", kind: 'bill' as const, perSession: true, icon: 'receipt', slaSeconds: 240, priority: 'normal' as const },
   { label: 'Assistance', icon: 'life-buoy', slaSeconds: 120, priority: 'high' as const },
   { label: 'Autre demande', icon: 'message-circle', slaSeconds: 240, priority: 'normal' as const },
 ];

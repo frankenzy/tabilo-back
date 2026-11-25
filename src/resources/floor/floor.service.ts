@@ -7,6 +7,7 @@ import type { Scope } from '../../commons/types';
 import { randomToken } from '../../commons/utils/crypto';
 import { conflict, notFound } from '../../commons/utils/errors';
 import { OutboxService } from '../outbox/outbox.service';
+import { closeBillRequests } from '../service-requests/bill';
 import { ACTIVE_STATUSES } from '../service-requests/request-lifecycle';
 import { raiseUnpaidAlerts } from '../unpaid-alerts/unpaid-alerts';
 
@@ -448,6 +449,8 @@ export class FloorService {
     const sessionIds = open.map((s) => s.id);
     // Spec 027, R9 : libérer une table avec un reste à régler crée une alerte par client concerné.
     await raiseUnpaidAlerts(tx, this.outbox, sessionIds, 'released');
+    // Spec 028, R6 : les demandes d'addition de ces clients se closent avec leur session.
+    await closeBillRequests(tx, this.outbox, sessionIds, 'released', { type: 'staff', id: scope.userId });
     await tx.tableSession.updateMany({
       where: { id: { in: sessionIds } },
       data: { status: 'closed', closedAt: new Date(), closedById: scope.userId },

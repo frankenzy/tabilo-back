@@ -69,12 +69,12 @@ describe('Demandes : parcours client, cycle de vie, concurrence, escalade', () =
       const guest = await openSession(t, table.code);
       await guestRequest(t, guest, 0);
       await guestRequest(t, guest, 1);
-      const over = await t.http.post('/api/v1/guest/requests').set(guest.headers).send({ requestTypeId: guest.typeIds[2] });
+      const over = await t.http.post('/api/v1/guest/requests').set(guest.headers).send({ requestTypeId: guest.typeIds[3] });
       expect(over.status).toBe(429);
       expect(over.body.code).toBe('TOO_MANY_ACTIVE_REQUESTS');
 
       await t.http.patch(owner.base).set(owner.auth).send({ maxActiveRequestsPerTable: 5, requestCooldownSeconds: 30 }).expect(200);
-      const cooled = await t.http.post('/api/v1/guest/requests').set(guest.headers).send({ requestTypeId: guest.typeIds[2] });
+      const cooled = await t.http.post('/api/v1/guest/requests').set(guest.headers).send({ requestTypeId: guest.typeIds[3] });
       expect(cooled.status).toBe(429);
       expect(cooled.body.code).toBe('REQUEST_COOLDOWN');
       await t.http.patch(owner.base).set(owner.auth).send({ requestCooldownSeconds: 0 }).expect(200);
