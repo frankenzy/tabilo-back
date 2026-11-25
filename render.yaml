@@ -11,7 +11,8 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     # Pas de « pre-deploy » sur l'offre gratuite : les migrations passent au démarrage.
-    dockerCommand: sh -c "./node_modules/.bin/prisma migrate deploy && node dist/main.js"
+    # Un seul mot, sans guillemets : Render ne passe pas la commande par un shell.
+    dockerCommand: ./scripts/demarrage.sh
     healthCheckPath: /api/v1/health/live
     autoDeploy: true
     envVars:

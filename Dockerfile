@@ -26,6 +26,7 @@ COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --from=build --chown=node:node /app/prisma ./prisma
 COPY --chown=node:node package.json ./
+COPY --chown=node:node scripts/demarrage.sh ./scripts/demarrage.sh
 USER node
 EXPOSE 3090
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
