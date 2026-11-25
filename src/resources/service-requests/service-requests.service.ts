@@ -4,6 +4,7 @@ import { PrismaService, Tx } from '../../commons/prisma/prisma.service';
 import { can, GuestSession, Scope } from '../../commons/types';
 import { conflict, forbidden, notFound, tooMany, unprocessable } from '../../commons/utils/errors';
 import { Page, skipTake, toPage } from '../../commons/utils/pagination';
+import { ClientLocation, evaluateZone, ZoneResult } from '../../commons/utils/zone';
 import { DomainEventType, OutboxService } from '../outbox/outbox.service';
 import { AssignRequestDto, CreateStaffRequestDto, ListRequestsQuery } from './dto';
 import { ACTIVE_STATUSES, canTransition, TERMINAL_STATUSES } from './request-lifecycle';
@@ -25,7 +26,7 @@ const STATUS_LABELS: Record<RequestStatus, string> = {
   cancelled: 'annulée',
 };
 
-interface Actor {
+export interface Actor {
   type: ActorType;
   id: string | null;
 }
@@ -58,7 +59,14 @@ export interface OrderLineInput {
 /** Ce qu'un client peut créer : une demande de service, ou une commande depuis la carte. */
 export type GuestCreateInput =
   | { kind: 'service'; requestTypeId: string; note?: string; quantity?: number }
-  | { kind: 'order'; items: OrderLineInput[]; note?: string };
+  | {
+      kind: 'order';
+      items: OrderLineInput[];
+      note?: string;
+      /** Spec 027, R8 : position au moment de commander ; utilisée pour le calcul puis oubliée. */
+      location?: ClientLocation;
+      locationStatus?: 'denied' | 'unavailable';
+    };
 
 interface ResolvedLine {
   menuItemId: string;
@@ -73,7 +81,7 @@ export interface GuestCreateResult {
   deduplicated: boolean;
 }
 
-const staffActor = (scope: Scope): Actor => ({ type: 'staff', id: scope.userId });
+export const staffActor = (scope: Scope): Actor => ({ type: 'staff', id: scope.userId });
 
 @Injectable()
 export class ServiceRequestsService {
@@ -99,6 +107,7 @@ export class ServiceRequestsService {
       where.status = 'resolved';
       where.totalMinor = { not: null };
       where.paidAt = null;
+      where.writtenOffAt = null; // Spec 027, R9 : « Parti sans payer » sort de la liste.
     } else if (query.scope === 'active') where.status = { in: [...ACTIVE_STATUSES] };
     else if (query.scope === 'closed') where.status = { in: [...TERMINAL_STATUSES] };
     if (query.late) {
@@ -221,8 +230,14 @@ export class ServiceRequestsService {
       if (input.kind === 'service') {
         type = await this.loadServiceType(tx, guest.establishmentId, input.requestTypeId);
         // Une seule demande active par table et par type : un second appui renvoie l'existante.
+        // Spec 027, R6 : par client pour une demande propre à chacun (« L'addition »).
         const duplicate = await tx.serviceRequest.findFirst({
-          where: { tableId: guest.tableId, requestTypeId: type.id, status: { in: [...ACTIVE_STATUSES] } },
+          where: {
+            tableId: guest.tableId,
+            requestTypeId: type.id,
+            status: { in: [...ACTIVE_STATUSES] },
+            ...(type.perSession ? { sessionId: guest.id } : {}),
+          },
           select: { id: true },
         });
         if (duplicate) return { id: duplicate.id, deduplicated: true };
@@ -235,7 +250,10 @@ export class ServiceRequestsService {
       const [establishment, table, activeOnTable] = await Promise.all([
         tx.establishment.findUniqueOrThrow({
           where: { id: guest.establishmentId },
-          select: { maxActiveRequestsPerTable: true, maxRequestsPerSession: true, requestCooldownSeconds: true },
+          select: {
+            maxActiveRequestsPerTable: true, maxRequestsPerSession: true, requestCooldownSeconds: true,
+            zoneLatitude: true, zoneLongitude: true, zoneRadiusM: true,
+          },
         }),
         tx.diningTable.findFirst({
           where: { id: guest.tableId, establishmentId: guest.establishmentId, archivedAt: null },
@@ -266,10 +284,14 @@ export class ServiceRequestsService {
         actor: { type: 'customer', id: null },
         sessionId: guest.id,
         idempotencyKey,
+        // Spec 027, R8 : seule une commande porte le signalement de zone. Les coordonnées ne sont pas transmises plus loin.
+        zone: input.kind === 'order' ? evaluateZone(establishment, input.location ?? null) : null,
       });
+      const now = new Date();
       await tx.tableSession.update({
         where: { id: guest.id },
-        data: { requestCount: { increment: 1 }, lastRequestAt: new Date() },
+        // Spec 027, R9 : toute demande compte comme activité et lève une suspension d'alerte.
+        data: { requestCount: { increment: 1 }, lastRequestAt: now, lastActivityAt: now, alertSnoozedUntil: null },
       });
       return { id: created.id, deduplicated: false };
     });
@@ -281,13 +303,19 @@ export class ServiceRequestsService {
     return { request: toGuestRequestView(request), deduplicated: result.deduplicated };
   }
 
-  /** Demandes visibles depuis une table : celles encore actives et celles de la session. */
+  /**
+   * Spec 027, R1 : ce que voit un téléphone — les demandes de SA session, plus les demandes de service
+   * encore actives communes à la table (appeler un serveur, de l'eau…). Jamais les commandes des autres.
+   */
   async listForGuest(guest: GuestSession): Promise<GuestRequestView[]> {
     const rows = await this.prisma.serviceRequest.findMany({
       where: {
         tableId: guest.tableId,
         establishmentId: guest.establishmentId,
-        OR: [{ sessionId: guest.id }, { status: { in: [...ACTIVE_STATUSES] } }],
+        OR: [
+          { sessionId: guest.id },
+          { status: { in: [...ACTIVE_STATUSES] }, requestType: { kind: 'service', perSession: false } },
+        ],
       },
       include: REQUEST_INCLUDE,
       orderBy: { createdAt: 'desc' },
@@ -308,6 +336,7 @@ export class ServiceRequestsService {
         eventType: 'request.cancelled',
         actor: { type: 'customer', id: null },
       });
+      await this.endSessionIfDone(tx, current.sessionId);
     });
     this.outbox.kick();
     const request = await this.prisma.serviceRequest.findUniqueOrThrow({ where: { id }, include: REQUEST_INCLUDE });
@@ -402,8 +431,43 @@ export class ServiceRequestsService {
       if (current.status !== 'resolved') {
         throw conflict('NOT_SERVED', `Action impossible : la commande est ${STATUS_LABELS[current.status]}, pas encore servie.`);
       }
+      if (current.writtenOffAt) throw conflict('WRITTEN_OFF', 'Commande marquée « Parti sans payer ».');
       if (!(await this.markPaid(tx, current, staffActor(scope)))) throw conflict('ALREADY_PAID', 'Déjà réglée.');
+      await this.afterPayment(tx, current.sessionId, scope.userId);
     });
+  }
+
+  /** Spec 027, R3 : régler toutes les commandes servies non réglées d'une session (un client). */
+  async settleSession(scope: Scope, sessionId: string): Promise<{ settled: number; amountMinor: number }> {
+    const result = await this.prisma.$transaction(async (tx) => {
+      const session = await tx.tableSession.findFirst({
+        where: { id: sessionId, tenantId: scope.tenantId, establishmentId: scope.establishmentId },
+        select: { id: true },
+      });
+      if (!session) throw notFound('SESSION_NOT_FOUND', 'Client introuvable.');
+      const settled = await this.settleSessionTx(tx, sessionId, staffActor(scope));
+      if (settled.settled === 0) throw conflict('NOTHING_TO_SETTLE', 'Rien à régler pour ce client.');
+      return settled;
+    });
+    this.outbox.kick();
+    return result;
+  }
+
+  /** Règle les commandes servies non réglées d'une session, dans la transaction de l'appelant. */
+  async settleSessionTx(tx: Tx, sessionId: string, actor: Actor): Promise<{ settled: number; amountMinor: number }> {
+    const unpaid = await tx.serviceRequest.findMany({
+      where: { sessionId, status: 'resolved', totalMinor: { not: null }, paidAt: null, writtenOffAt: null },
+    });
+    let settled = 0;
+    let amountMinor = 0;
+    for (const request of unpaid) {
+      if (await this.markPaid(tx, request, actor)) {
+        settled += 1;
+        amountMinor += request.totalMinor ?? 0;
+      }
+    }
+    if (settled > 0) await this.afterPayment(tx, sessionId, actor.id);
+    return { settled, amountMinor };
   }
 
   /**
@@ -424,7 +488,7 @@ export class ServiceRequestsService {
       const starts = [session?.openedAt, active?.createdAt].filter((date): date is Date => !!date).map((date) => date.getTime());
       if (starts.length === 0) throw conflict('NOTHING_TO_SETTLE', 'La table est libre : rien à régler.');
       const unpaid = await tx.serviceRequest.findMany({
-        where: { ...where, status: 'resolved', totalMinor: { not: null }, paidAt: null, createdAt: { gte: new Date(Math.min(...starts)) } },
+        where: { ...where, status: 'resolved', totalMinor: { not: null }, paidAt: null, writtenOffAt: null, createdAt: { gte: new Date(Math.min(...starts)) } },
       });
       if (unpaid.length === 0) throw conflict('NOTHING_TO_SETTLE', 'Rien à régler sur cette table.');
       let settled = 0;
@@ -434,6 +498,9 @@ export class ServiceRequestsService {
           settled += 1;
           amountMinor += request.totalMinor ?? 0;
         }
+      }
+      for (const sessionId of new Set(unpaid.map((request) => request.sessionId))) {
+        await this.afterPayment(tx, sessionId, scope.userId);
       }
       return { settled, amountMinor };
     });
@@ -449,6 +516,7 @@ export class ServiceRequestsService {
         payload: reason ? { reason } : undefined,
       });
       await this.closeAssignment(tx, current.id);
+      await this.endSessionIfDone(tx, current.sessionId);
     });
   }
 
@@ -630,10 +698,14 @@ export class ServiceRequestsService {
   /** Spec 026 : marque une commande servie réglée ; false si elle l'était déjà (ou a changé entre-temps). */
   private async markPaid(tx: Tx, request: ServiceRequest, actor: Actor): Promise<boolean> {
     const updated = await tx.serviceRequest.updateMany({
-      where: { id: request.id, establishmentId: request.establishmentId, status: 'resolved', paidAt: null },
+      where: { id: request.id, establishmentId: request.establishmentId, status: 'resolved', paidAt: null, writtenOffAt: null },
       data: { paidAt: new Date(), version: { increment: 1 } },
     });
     if (updated.count !== 1) return false;
+    if (request.sessionId) {
+      // Spec 027, R9 : un règlement compte comme activité de la session.
+      await tx.tableSession.update({ where: { id: request.sessionId }, data: { lastActivityAt: new Date(), alertSnoozedUntil: null } });
+    }
     await tx.serviceRequestEvent.create({
       data: {
         tenantId: request.tenantId,
@@ -647,6 +719,49 @@ export class ServiceRequestsService {
     });
     await this.outbox.add(tx, request, 'request.paid', { requestId: request.id, actorId: actor.id });
     return true;
+  }
+
+  /**
+   * Après un règlement : l'alerte de départ sans payer de la session, s'il n'y a plus rien à régler,
+   * est close (« Réglé »), puis la session se termine si tout est servi et réglé (spec 027, R4 et R9).
+   */
+  private async afterPayment(tx: Tx, sessionId: string | null, actorId: string | null): Promise<void> {
+    if (!sessionId) return;
+    const due = await tx.serviceRequest.count({
+      where: { sessionId, status: 'resolved', totalMinor: { not: null }, paidAt: null, writtenOffAt: null },
+    });
+    if (due === 0) {
+      const open = await tx.unpaidAlert.findMany({ where: { sessionId, resolvedAt: null }, select: { id: true, tenantId: true, establishmentId: true } });
+      for (const alert of open) {
+        await tx.unpaidAlert.update({ where: { id: alert.id }, data: { resolvedAt: new Date(), resolution: 'paid', resolvedById: actorId } });
+        await this.outbox.add(tx, alert, 'alert.changed', { alertId: alert.id, actorId });
+      }
+    }
+    await this.endSessionIfDone(tx, sessionId);
+  }
+
+  /**
+   * Spec 027, R4 : une session se termine quand elle n'a plus de demande en cours ni de commande servie à régler.
+   * Avec au moins une commande réglée, elle est « réglée » (le téléphone affiche « Réglé · Merci ») ;
+   * si ses commandes ont toutes été marquées « Parti sans payer », elle est fermée.
+   */
+  async endSessionIfDone(tx: Tx, sessionId: string | null): Promise<void> {
+    if (!sessionId) return;
+    const orders = { sessionId, totalMinor: { not: null } } satisfies Prisma.ServiceRequestWhereInput;
+    const [active, due, paid, writtenOff] = await Promise.all([
+      tx.serviceRequest.count({ where: { sessionId, status: { in: [...ACTIVE_STATUSES] } } }),
+      tx.serviceRequest.count({ where: { ...orders, status: 'resolved', paidAt: null, writtenOffAt: null } }),
+      tx.serviceRequest.count({ where: { ...orders, paidAt: { not: null } } }),
+      tx.serviceRequest.count({ where: { ...orders, writtenOffAt: { not: null } } }),
+    ]);
+    if (active > 0 || due > 0 || (paid === 0 && writtenOff === 0)) return;
+    const status = paid > 0 ? 'settled' : 'closed';
+    const session = await tx.tableSession.findUnique({ where: { id: sessionId }, select: { tenantId: true, establishmentId: true } });
+    if (!session) return;
+    const updated = await tx.tableSession.updateMany({ where: { id: sessionId, status: 'open' }, data: { status, closedAt: new Date() } });
+    if (updated.count === 1) {
+      await this.outbox.add(tx, session, status === 'settled' ? 'session.settled' : 'session.closed', { sessionIds: [sessionId] });
+    }
   }
 
   private async stepAssign(
@@ -727,6 +842,7 @@ export class ServiceRequestsService {
       actor: Actor;
       sessionId: string | null;
       idempotencyKey: string | null;
+      zone?: ZoneResult | null;
     },
   ): Promise<ServiceRequest> {
     const now = new Date();
@@ -746,6 +862,8 @@ export class ServiceRequestsService {
         createdById: input.actor.id,
         idempotencyKey: input.idempotencyKey,
         totalMinor: lines.length > 0 ? lines.reduce((sum, line) => sum + line.unitPriceMinor * line.quantity, 0) : null,
+        zoneCheck: input.zone?.zoneCheck ?? null,
+        zoneDistanceM: input.zone?.zoneDistanceM ?? null,
         createdAt: now,
         dueAt: new Date(now.getTime() + input.type.slaSeconds * 1000),
       },
@@ -779,7 +897,7 @@ export class ServiceRequestsService {
   private async loadServiceType(tx: Tx, establishmentId: string, requestTypeId: string) {
     const type = await tx.requestType.findFirst({
       where: { id: requestTypeId, establishmentId, kind: 'service', isActive: true, archivedAt: null },
-      select: { id: true, priority: true, slaSeconds: true, allowNote: true },
+      select: { id: true, priority: true, slaSeconds: true, allowNote: true, perSession: true },
     });
     if (!type) throw notFound('REQUEST_TYPE_NOT_FOUND', 'Type de demande indisponible.');
     return type;
@@ -788,7 +906,7 @@ export class ServiceRequestsService {
   private async loadOrderType(tx: Tx, establishmentId: string) {
     const type = await tx.requestType.findFirst({
       where: { establishmentId, kind: 'order', isActive: true, archivedAt: null },
-      select: { id: true, priority: true, slaSeconds: true, allowNote: true },
+      select: { id: true, priority: true, slaSeconds: true, allowNote: true, perSession: true },
     });
     if (!type) throw unprocessable('ORDERING_DISABLED', 'La commande en ligne est suspendue. Adressez-vous au personnel.');
     return type;

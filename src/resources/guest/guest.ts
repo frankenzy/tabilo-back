@@ -7,13 +7,14 @@ import { Throttle } from '@nestjs/throttler';
 import { rateLimit } from '../../commons/utils/rate-limit';
 import { Transform, Type } from 'class-transformer';
 import {
-  ArrayMaxSize, ArrayMinSize, IsArray, IsInt, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, ValidateNested,
+  ArrayMaxSize, ArrayMinSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { CurrentGuest, Public } from '../../commons/decorators';
 import { GuestSessionGuard, SESSION_HEADER } from '../../commons/guards/guest-session.guard';
 import { PrismaService } from '../../commons/prisma/prisma.service';
 import type { GuestSession } from '../../commons/types';
 import { hashToken, randomToken } from '../../commons/utils/crypto';
+import { freeMarker } from '../../commons/utils/zone';
 import { notFound, tooMany, unprocessable } from '../../commons/utils/errors';
 import { MenuModule } from '../menu/menu.module';
 import { MenuService } from '../menu/menu.service';
@@ -55,6 +56,19 @@ export class OrderLineDto {
   quantity: number;
 }
 
+/** Spec 027, R8 : position du téléphone au moment de commander. Utilisée pour le calcul, jamais conservée. */
+export class OrderLocationDto {
+  @ApiProperty() @IsNumber({ allowNaN: false, allowInfinity: false }) @Min(-90) @Max(90)
+  latitude: number;
+
+  @ApiProperty() @IsNumber({ allowNaN: false, allowInfinity: false }) @Min(-180) @Max(180)
+  longitude: number;
+
+  @ApiProperty({ description: 'Précision annoncée par le téléphone, en mètres' })
+  @IsNumber({ allowNaN: false, allowInfinity: false }) @Min(0) @Max(100_000)
+  accuracyM: number;
+}
+
 export class GuestCreateOrderDto {
   @ApiProperty({ type: [OrderLineDto], description: 'Identifiants et quantités seulement : les prix viennent de la carte.' })
   @IsArray() @ArrayMinSize(1) @ArrayMaxSize(30) @ValidateNested({ each: true }) @Type(() => OrderLineDto)
@@ -63,6 +77,14 @@ export class GuestCreateOrderDto {
   @ApiPropertyOptional({ maxLength: NOTE_MAX_LENGTH })
   @IsOptional() @Transform(trim) @IsString() @MaxLength(NOTE_MAX_LENGTH)
   note?: string;
+
+  @ApiPropertyOptional({ type: OrderLocationDto, description: 'Spec 027 : position au moment de commander (non conservée)' })
+  @IsOptional() @ValidateNested() @Type(() => OrderLocationDto)
+  location?: OrderLocationDto;
+
+  @ApiPropertyOptional({ enum: ['denied', 'unavailable'], description: 'Spec 027 : position refusée ou indisponible' })
+  @IsOptional() @IsIn(['denied', 'unavailable'])
+  locationStatus?: 'denied' | 'unavailable';
 }
 
 export class SuggestionsQueryDto {
@@ -108,24 +130,48 @@ export class GuestService {
       throw tooMany('TOO_MANY_SESSIONS', 'Trop de connexions pour cette table. Réessayez dans quelques minutes.');
     }
     const token = randomToken(32);
-    const expiresAt = new Date(Date.now() + qr.establishment.sessionTtlMinutes * 60_000);
-    const session = await this.prisma.tableSession.create({
-      data: {
-        tenantId: qr.tenantId,
-        establishmentId: qr.establishmentId,
-        tableId: qr.tableId,
-        qrCodeId: qr.id,
-        tokenHash: hashToken(token),
-        expiresAt,
-      },
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + qr.establishment.sessionTtlMinutes * 60_000);
+    const session = await this.prisma.$transaction(async (tx) => {
+      // Spec 027, R2 : verrou par table, pour que deux scans simultanés reçoivent deux repères différents
+      // (l'index partiel unique en base reste le dernier rempart).
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${qr.tableId}::text, 27))`;
+      // Une session dépassée mais pas encore balayée libère son repère.
+      await tx.tableSession.updateMany({
+        where: { tableId: qr.tableId, status: 'open', expiresAt: { lte: now } },
+        data: { status: 'expired', closedAt: now },
+      });
+      const [open, last] = await Promise.all([
+        tx.tableSession.findMany({ where: { tableId: qr.tableId, status: 'open' }, select: { markerIndex: true } }),
+        tx.tableSession.findFirst({ where: { tableId: qr.tableId }, orderBy: { openedAt: 'desc' }, select: { markerIndex: true } }),
+      ]);
+      const markerIndex = freeMarker(open.map((s) => s.markerIndex), last?.markerIndex ?? null);
+      if (markerIndex === null) {
+        throw tooMany('TOO_MANY_SESSIONS', 'Trop de connexions pour cette table. Adressez-vous au personnel.');
+      }
+      return tx.tableSession.create({
+        data: {
+          tenantId: qr.tenantId,
+          establishmentId: qr.establishmentId,
+          tableId: qr.tableId,
+          qrCodeId: qr.id,
+          tokenHash: hashToken(token),
+          expiresAt,
+          markerIndex,
+          lastActivityAt: now,
+        },
+      });
     });
     return { token, expiresAt: expiresAt.toISOString(), ...(await this.context({ ...session })) };
   }
 
   /** Ce que le client voit : nom du lieu, sa table, les demandes possibles. Rien d'autre. */
-  async context(guest: Pick<GuestSession, 'establishmentId' | 'tableId'>) {
+  async context(guest: Pick<GuestSession, 'establishmentId' | 'tableId' | 'markerIndex'>) {
     const [establishment, table, types, menu] = await Promise.all([
-      this.prisma.establishment.findUniqueOrThrow({ where: { id: guest.establishmentId }, select: { name: true, currency: true, pairingsEnabled: true } }),
+      this.prisma.establishment.findUniqueOrThrow({
+        where: { id: guest.establishmentId },
+        select: { name: true, currency: true, pairingsEnabled: true, zoneLatitude: true, zoneLongitude: true },
+      }),
       this.prisma.diningTable.findUniqueOrThrow({
         where: { id: guest.tableId },
         select: { label: true, area: { select: { name: true } } },
@@ -147,6 +193,10 @@ export class GuestService {
       orderingEnabled: categories.length > 0 && types.some((type) => type.kind === 'order'),
       // Spec 012, R7 : « Souvent pris avec » dans la fiche d'un plat, si l'établissement l'a activé.
       pairingsEnabled: establishment.pairingsEnabled,
+      // Spec 027, R2 : repère de la session, affiché sur le téléphone et côté personnel.
+      marker: guest.markerIndex,
+      // Spec 027, R8 : une zone existe, le téléphone demandera sa position au moment de commander.
+      zone: establishment.zoneLatitude !== null && establishment.zoneLongitude !== null,
     };
   }
 }

@@ -6,6 +6,7 @@ import { PrismaService } from '../commons/prisma/prisma.service';
 import { RedisService } from '../commons/redis/redis.service';
 import { EscalationService } from '../resources/escalation/escalation.service';
 import { DomainEvent, OutboxService } from '../resources/outbox/outbox.service';
+import { raiseUnpaidAlerts, UnpaidAlertsService } from '../resources/unpaid-alerts/unpaid-alerts';
 
 const QUEUE = 'tabilo-escalation';
 
@@ -40,6 +41,7 @@ export class TasksService implements OnModuleInit, OnApplicationShutdown {
     private readonly redis: RedisService,
     private readonly outbox: OutboxService,
     private readonly escalation: EscalationService,
+    private readonly unpaidAlerts: UnpaidAlertsService,
   ) {}
 
   onModuleInit(): void {
@@ -122,12 +124,26 @@ export class TasksService implements OnModuleInit, OnApplicationShutdown {
   @Interval(60_000)
   async expireSessions(): Promise<void> {
     if (this.skip()) return;
-    await this.guard('sessions', () =>
-      this.prisma.tableSession.updateMany({
-        where: { status: 'open', expiresAt: { lte: new Date() } },
-        data: { status: 'expired', closedAt: new Date() },
-      }),
-    );
+    await this.guard('sessions', async () => {
+      const now = new Date();
+      const raised = await this.prisma.$transaction(async (tx) => {
+        const expired = await tx.tableSession.findMany({ where: { status: 'open', expiresAt: { lte: now } }, select: { id: true }, take: 500 });
+        if (expired.length === 0) return 0;
+        const ids = expired.map((session) => session.id);
+        // Spec 027, R10 : une session expirée qui laisse un reste à régler déclenche l'alerte.
+        const count = await raiseUnpaidAlerts(tx, this.outbox, ids, 'expired');
+        await tx.tableSession.updateMany({ where: { id: { in: ids }, status: 'open' }, data: { status: 'expired', closedAt: now } });
+        return count;
+      });
+      if (raised > 0) this.outbox.kick();
+    });
+  }
+
+  /** Spec 027, R9 : alertes de départ sans payer après le délai d'inactivité de chaque établissement. */
+  @Interval(60_000)
+  async sweepUnpaidAlerts(): Promise<void> {
+    if (this.skip()) return;
+    await this.guard('alertes impayés', () => this.unpaidAlerts.sweep());
   }
 
   /** Purge quotidienne des données techniques sans valeur d'historique. */

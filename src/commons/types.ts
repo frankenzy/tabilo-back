@@ -26,6 +26,8 @@ export interface GuestSession {
   tenantId: string;
   establishmentId: string;
   tableId: string;
+  /** Spec 027, R2 : repère de la session. */
+  markerIndex: number;
 }
 
 export interface AppRequest extends FastifyRequest {

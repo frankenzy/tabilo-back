@@ -68,6 +68,20 @@ export interface SalesFigures {
   /** Spec 026, R7 : commandes réglées pendant la période, datées de leur règlement. */
   paidMinor: number;
   paidOrders: number;
+  /** Spec 027, R13 : commandes marquées « Parti sans payer » pendant la période, datées du marquage. */
+  writtenOffMinor: number;
+  /** Nombre de clients (sessions) concernés. */
+  writtenOffCustomers: number;
+}
+
+/** Spec 027, R13 : un client parti sans payer, pour la liste de la carte « Impayés ». */
+export interface WrittenOffView {
+  sessionId: string | null;
+  table: { id: string; label: string };
+  marker: number | null;
+  amountMinor: number;
+  writtenOffAt: string;
+  writtenOffBy: string | null;
 }
 
 /** Spec 026, R7 : commandes servies non réglées, toutes dates confondues. */
@@ -495,7 +509,10 @@ export class AnalyticsService {
       {
         currency: string;
         from: string;
-        totals: { shift: number; totalMinor: number; orders: number; passages: number; paidMinor: number; paidOrders: number }[];
+        totals: {
+          shift: number; totalMinor: number; orders: number; passages: number; paidMinor: number; paidOrders: number;
+          writtenOffMinor: number; writtenOffCustomers: number;
+        }[];
         outstanding: { amountMinor: number; orders: number; tables: number };
       }[]
     >`
@@ -529,7 +546,12 @@ export class AnalyticsService {
             (SELECT coalesce(sum(r."totalMinor"), 0)::bigint::float8 FROM "ServiceRequest" r
               WHERE ${this.scopeSql(scope)} AND r."totalMinor" IS NOT NULL AND r."paidAt" >= g.start AND r."paidAt" < g.stop) AS "paidMinor",
             (SELECT count(*)::int FROM "ServiceRequest" r
-              WHERE ${this.scopeSql(scope)} AND r."totalMinor" IS NOT NULL AND r."paidAt" >= g.start AND r."paidAt" < g.stop) AS "paidOrders"
+              WHERE ${this.scopeSql(scope)} AND r."totalMinor" IS NOT NULL AND r."paidAt" >= g.start AND r."paidAt" < g.stop) AS "paidOrders",
+            -- Spec 027, R13 : impayés de la période, datés de leur marquage ; un client = une session.
+            (SELECT coalesce(sum(r."totalMinor"), 0)::bigint::float8 FROM "ServiceRequest" r
+              WHERE ${this.scopeSql(scope)} AND r."totalMinor" IS NOT NULL AND r."writtenOffAt" >= g.start AND r."writtenOffAt" < g.stop) AS "writtenOffMinor",
+            (SELECT count(DISTINCT coalesce(r."sessionId", r.id))::int FROM "ServiceRequest" r
+              WHERE ${this.scopeSql(scope)} AND r."totalMinor" IS NOT NULL AND r."writtenOffAt" >= g.start AND r."writtenOffAt" < g.stop) AS "writtenOffCustomers"
           FROM ranges g LEFT JOIN served sv ON sv.shift = g.shift
           GROUP BY g.shift, g.start, g.stop
         ) t) AS totals,
@@ -539,11 +561,14 @@ export class AnalyticsService {
             'orders', count(*)::int,
             'tables', count(DISTINCT r."tableId")::int)
           FROM "ServiceRequest" r
-          WHERE ${this.scopeSql(scope)} AND r.status = 'resolved' AND r."totalMinor" IS NOT NULL AND r."paidAt" IS NULL) AS outstanding
+          WHERE ${this.scopeSql(scope)} AND r.status = 'resolved' AND r."totalMinor" IS NOT NULL AND r."paidAt" IS NULL
+            AND r."writtenOffAt" IS NULL) AS outstanding
       FROM est`;
     if (!row) throw unprocessable('ESTABLISHMENT_NOT_FOUND', 'Établissement introuvable.');
     const figures = (shift: number): SalesFigures => {
-      const t = row.totals.find((x) => x.shift === shift) ?? { totalMinor: 0, orders: 0, passages: 0, paidMinor: 0, paidOrders: 0 };
+      const t = row.totals.find((x) => x.shift === shift) ?? {
+        totalMinor: 0, orders: 0, passages: 0, paidMinor: 0, paidOrders: 0, writtenOffMinor: 0, writtenOffCustomers: 0,
+      };
       return {
         totalMinor: Math.round(t.totalMinor),
         orders: t.orders,
@@ -551,10 +576,44 @@ export class AnalyticsService {
         averageMinor: t.passages > 0 ? Math.round(t.totalMinor / t.passages) : null,
         paidMinor: Math.round(t.paidMinor),
         paidOrders: t.paidOrders,
+        writtenOffMinor: Math.round(t.writtenOffMinor),
+        writtenOffCustomers: t.writtenOffCustomers,
       };
     };
     const outstanding = { amountMinor: Math.round(row.outstanding.amountMinor), orders: row.outstanding.orders, tables: row.outstanding.tables };
     return { currency: row.currency, period, from: row.from, current: figures(0), previous: figures(1), outstanding };
+  }
+
+  /** Spec 027, R13 : clients partis sans payer pendant la période en cours, le plus récent d'abord. */
+  async writtenOff(scope: Scope, period: SalesPeriod): Promise<WrittenOffView[]> {
+    const trunc = Prisma.raw(`'${period}'`);
+    const rows = await this.prisma.$queryRaw<
+      { sessionId: string | null; tableId: string; tableLabel: string; marker: number | null; amountMinor: number; writtenOffAt: Date; writtenOffBy: string | null }[]
+    >`
+      WITH est AS (
+        SELECT (date_trunc(${trunc}, now() AT TIME ZONE e.timezone)) AT TIME ZONE e.timezone AS start
+        FROM "Establishment" e
+        WHERE e.id = ${scope.establishmentId}::uuid AND e."tenantId" = ${scope.tenantId}::uuid
+      )
+      SELECT r."sessionId", t.id AS "tableId", t.label AS "tableLabel", s."markerIndex" AS marker,
+        sum(r."totalMinor")::int AS "amountMinor", max(r."writtenOffAt") AS "writtenOffAt",
+        (SELECT u."firstName" || ' ' || u."lastName" FROM "User" u WHERE u.id = (array_agg(r."writtenOffById" ORDER BY r."writtenOffAt" DESC))[1]) AS "writtenOffBy"
+      FROM "ServiceRequest" r
+      JOIN est ON true
+      JOIN "DiningTable" t ON t.id = r."tableId"
+      LEFT JOIN "TableSession" s ON s.id = r."sessionId"
+      WHERE ${this.scopeSql(scope)} AND r."totalMinor" IS NOT NULL AND r."writtenOffAt" >= est.start
+      GROUP BY r."sessionId", t.id, t.label, s."markerIndex", CASE WHEN r."sessionId" IS NULL THEN r.id END
+      ORDER BY max(r."writtenOffAt") DESC
+      LIMIT 200`;
+    return rows.map((row) => ({
+      sessionId: row.sessionId,
+      table: { id: row.tableId, label: row.tableLabel },
+      marker: row.marker,
+      amountMinor: row.amountMinor,
+      writtenOffAt: row.writtenOffAt.toISOString(),
+      writtenOffBy: row.writtenOffBy,
+    }));
   }
 
   private scopeSql(scope: Scope): Prisma.Sql {

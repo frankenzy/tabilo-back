@@ -16,7 +16,13 @@ export type DomainEventType =
   | 'request.escalation_acknowledged'
   /** Spec 026 : commande servie réglée. */
   | 'request.paid'
-  | 'session.closed';
+  /** Spec 027, R9 : commande marquée « Parti sans payer ». */
+  | 'request.written_off'
+  | 'session.closed'
+  /** Spec 027, R4 : toutes les commandes de la session sont servies et réglées. */
+  | 'session.settled'
+  /** Spec 027, R9 : alerte de départ sans payer créée ou traitée. */
+  | 'alert.changed';
 
 export interface DomainEventPayload {
   requestId?: string;
@@ -25,6 +31,7 @@ export interface DomainEventPayload {
   assigneeId?: string | null;
   previousAssigneeId?: string | null;
   ruleName?: string;
+  alertId?: string;
 }
 
 export interface DomainEvent extends DomainEventPayload {

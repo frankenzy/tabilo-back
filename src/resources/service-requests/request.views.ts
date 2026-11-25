@@ -4,7 +4,9 @@ import { Prisma } from '@prisma/client';
 export const REQUEST_INCLUDE = {
   table: { select: { id: true, label: true } },
   area: { select: { id: true, name: true } },
-  requestType: { select: { id: true, label: true, icon: true, kind: true } },
+  requestType: { select: { id: true, label: true, icon: true, kind: true, perSession: true } },
+  // Spec 027, R2 : repère de la session qui a passé la demande.
+  session: { select: { markerIndex: true } },
   assignee: { select: { id: true, firstName: true, lastName: true } },
   items: { select: { menuItemId: true, name: true, quantity: true, unitPriceMinor: true }, orderBy: { name: 'asc' } },
 } satisfies Prisma.ServiceRequestInclude;
@@ -49,6 +51,12 @@ export interface RequestView {
   escalatedAt: string | null;
   /** Spec 026 : commande servie réglée ; null = à régler (ou pas encore servie). */
   paidAt: string | null;
+  /** Spec 027, R2 : repère de la session du client ; null pour une demande créée par le personnel. */
+  marker: number | null;
+  /** Spec 027, R8 : signalement de zone ; null sans zone (ou demande de service). */
+  zone: { status: 'inside' | 'outside' | 'imprecise' | 'denied'; distanceM: number | null } | null;
+  /** Spec 027, R9 : marquée « Parti sans payer ». */
+  writtenOffAt: string | null;
 }
 
 const iso = (date: Date | null): string | null => (date ? date.toISOString() : null);
@@ -64,7 +72,7 @@ export function toRequestView(request: RequestWithRelations): RequestView {
     quantity: request.quantity,
     table: request.table,
     area: request.area,
-    type: request.requestType,
+    type: typeOf(request),
     items: request.items,
     totalMinor: request.totalMinor,
     assignee: request.assignee,
@@ -79,13 +87,30 @@ export function toRequestView(request: RequestWithRelations): RequestView {
     cancelledAt: iso(request.cancelledAt),
     escalatedAt: iso(request.escalatedAt),
     paidAt: iso(request.paidAt),
+    marker: request.session?.markerIndex ?? null,
+    zone: request.zoneCheck ? { status: request.zoneCheck, distanceM: request.zoneDistanceM } : null,
+    writtenOffAt: iso(request.writtenOffAt),
   };
+}
+
+/** Le type exposé : sans le réglage interne `perSession`. */
+function typeOf(request: RequestWithRelations): RequestView['type'] {
+  const { id, label, icon, kind } = request.requestType;
+  return { id, label, icon, kind };
+}
+
+/**
+ * Spec 027, R1 : un événement destiné au client ne va qu'au téléphone concerné pour une commande
+ * ou une demande propre au client (« L'addition ») ; les autres demandes de service restent communes à la table.
+ */
+export function isPerSession(request: RequestWithRelations): boolean {
+  return request.sessionId !== null && (request.requestType.kind === 'order' || request.requestType.perSession);
 }
 
 /**
  * Vue destinée au client à table : le strict nécessaire au suivi.
  * Ni note (qui peut venir d'un autre téléphone), ni nom complet du personnel, ni données internes.
- * Le contenu d'une commande est visible de toute la table : c'est ce qui arrivera sur la table.
+ * Spec 027, R1 : le client ne voit que les commandes de sa session ; les demandes de service communes restent visibles de la table.
  */
 export interface GuestRequestView {
   id: string;
@@ -110,7 +135,7 @@ export function toGuestRequestView(request: RequestWithRelations): GuestRequestV
     id: request.id,
     // Spec 007, Q2 : le client reste sur « En préparation » jusqu'au service.
     status: request.status === 'ready' ? 'in_progress' : request.status,
-    type: request.requestType,
+    type: typeOf(request),
     items: request.items,
     totalMinor: request.totalMinor,
     quantity: request.quantity,

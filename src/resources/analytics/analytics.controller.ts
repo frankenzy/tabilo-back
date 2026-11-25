@@ -73,6 +73,13 @@ export class AnalyticsController {
     return this.analytics.sales(scope, query.period);
   }
 
+  @Get('unpaid')
+  @RequirePermissions('analytics.read')
+  @ApiOperation({ summary: 'Clients partis sans payer pendant la période en cours (spec 027)' })
+  unpaid(@CurrentScope() scope: Scope, @Query() query: SalesQuery) {
+    return this.analytics.writtenOff(scope, query.period);
+  }
+
   @Get('report')
   @RequirePermissions('analytics.read')
   @ApiOperation({ summary: 'Indicateurs sur une période (médianes, retards, répartitions)' })

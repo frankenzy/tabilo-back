@@ -1,12 +1,12 @@
 import { Body, Controller, Get, Injectable, Module, Patch, Post } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiProperty, ApiPropertyOptional, ApiTags, PartialType } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsBoolean, IsIn, IsInt, IsOptional, IsString, IsTimeZone, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, IsTimeZone, Max, MaxLength, Min, MinLength, ValidateIf } from 'class-validator';
 import { CurrentScope, CurrentUser, RequirePermissions } from '../../commons/decorators';
 import { PrismaService } from '../../commons/prisma/prisma.service';
 import { AuditService } from '../../commons/services/audit.service';
 import type { AuthUser, Scope } from '../../commons/types';
-import { forbidden } from '../../commons/utils/errors';
+import { forbidden, unprocessable } from '../../commons/utils/errors';
 import { createEstablishmentDefaults } from './defaults';
 
 /** Devises proposées pour les prix de la carte. */
@@ -53,11 +53,28 @@ export class UpdateEstablishmentDto extends PartialType(CreateEstablishmentDto) 
   @ApiPropertyOptional({ description: "« Souvent pris avec » dans la fiche d'un plat (spec 012, R7)" })
   @IsOptional() @IsBoolean()
   pairingsEnabled?: boolean;
+
+  @ApiPropertyOptional({ nullable: true, description: 'Spec 027, R12 : centre de la zone (avec zoneLongitude) ; null retire la zone' })
+  @IsOptional() @ValidateIf((_, value) => value !== null) @IsNumber({ allowNaN: false, allowInfinity: false }) @Min(-90) @Max(90)
+  zoneLatitude?: number | null;
+
+  @ApiPropertyOptional({ nullable: true })
+  @IsOptional() @ValidateIf((_, value) => value !== null) @IsNumber({ allowNaN: false, allowInfinity: false }) @Min(-180) @Max(180)
+  zoneLongitude?: number | null;
+
+  @ApiPropertyOptional({ description: 'Spec 027, R12 : rayon de la zone, de 50 à 500 m' })
+  @IsOptional() @IsInt() @Min(50) @Max(500)
+  zoneRadiusM?: number;
+
+  @ApiPropertyOptional({ description: 'Spec 027, R12 : délai avant l’alerte de départ sans payer, de 10 à 60 min' })
+  @IsOptional() @IsInt() @Min(10) @Max(60)
+  unpaidAlertMinutes?: number;
 }
 
 const SELECT = {
   id: true, name: true, timezone: true, currency: true, address: true, phone: true, sessionTtlMinutes: true,
   maxActiveRequestsPerTable: true, maxRequestsPerSession: true, requestCooldownSeconds: true, separateKitchen: true, pairingsEnabled: true,
+  zoneLatitude: true, zoneLongitude: true, zoneRadiusM: true, unpaidAlertMinutes: true,
 } as const;
 
 @Injectable()
@@ -75,6 +92,12 @@ export class EstablishmentsService {
   }
 
   async update(scope: Scope, dto: UpdateEstablishmentDto) {
+    // Spec 027, R12 : la zone se donne en entier (latitude et longitude) ou se retire en entier.
+    const lat = dto.zoneLatitude;
+    const lon = dto.zoneLongitude;
+    if ((lat === undefined) !== (lon === undefined) || (lat === null) !== (lon === null)) {
+      throw unprocessable('ZONE_INCOMPLETE', 'La zone demande une latitude et une longitude.');
+    }
     return this.prisma.$transaction(async (tx) => {
       const updated = await tx.establishment.update({ where: { id: scope.establishmentId }, data: dto, select: SELECT });
       await this.audit.record(

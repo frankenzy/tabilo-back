@@ -23,6 +23,7 @@ import { RolesModule } from './resources/roles/roles.module';
 import { ServiceRequestsModule } from './resources/service-requests/service-requests.module';
 import { StaffModule } from './resources/staff/staff.module';
 import { TasksModule } from './tasks/tasks.module';
+import { UnpaidAlertsModule } from './resources/unpaid-alerts/unpaid-alerts';
 
 /**
  * Monolithe modulaire. Ordre des gardes globaux : limitation de débit, puis accès
@@ -48,6 +49,7 @@ import { TasksModule } from './tasks/tasks.module';
     NotificationsModule,
     RealtimeModule,
     AnalyticsModule,
+    UnpaidAlertsModule,
     AuditLogsModule,
     TasksModule,
     HealthModule,

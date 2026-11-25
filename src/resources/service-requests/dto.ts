@@ -97,3 +97,8 @@ export class ListRequestsQuery extends PaginationQuery {
 export class SettleTableDto {
   @ApiProperty() @IsUUID() tableId: string;
 }
+
+/** Spec 027, R3 : régler un client (sa session). */
+export class SettleSessionDto {
+  @ApiProperty() @IsUUID() sessionId: string;
+}

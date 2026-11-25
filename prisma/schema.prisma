@@ -34,6 +34,30 @@ enum SessionStatus {
   open
   closed
   expired
+  /// Spec 027, R4 : toutes les commandes de la session sont servies et réglées.
+  settled
+}
+
+/// Spec 027, R8 : position du client par rapport à la zone de l'établissement, au moment de commander.
+enum ZoneCheck {
+  inside
+  outside
+  imprecise
+  denied
+}
+
+/// Spec 027, R9 : origine d'une alerte de départ sans payer.
+enum UnpaidAlertReason {
+  inactivity
+  released
+  expired
+}
+
+/// Spec 027, R9 : suite donnée à une alerte.
+enum UnpaidAlertResolution {
+  paid
+  still_here
+  walked_out
 }
 
 enum RequestStatus {
@@ -96,29 +120,36 @@ model Tenant {
 
 /// Point de vente (restaurant, café, glacier). Porte le paramétrage opérationnel.
 model Establishment {
-  id        String    @id @default(uuid()) @db.Uuid
-  tenantId  String    @db.Uuid
-  name      String
-  timezone  String    @default("Africa/Abidjan")
+  id                        String    @id @default(uuid()) @db.Uuid
+  tenantId                  String    @db.Uuid
+  name                      String
+  timezone                  String    @default("Africa/Abidjan")
   /// Devise des prix de la carte (code ISO 4217).
-  currency  String    @default("XOF")
-  address   String?
-  phone     String?
+  currency                  String    @default("XOF")
+  address                   String?
+  phone                     String?
   /// Durée de validité d'une session de table après un scan.
-  sessionTtlMinutes         Int @default(180)
+  sessionTtlMinutes         Int       @default(180)
   /// Nombre maximal de demandes non terminées par table.
-  maxActiveRequestsPerTable Int @default(5)
+  maxActiveRequestsPerTable Int       @default(5)
   /// Nombre maximal de demandes créées par une même session.
-  maxRequestsPerSession     Int @default(30)
+  maxRequestsPerSession     Int       @default(30)
   /// Délai minimal entre deux demandes d'une même session.
-  requestCooldownSeconds    Int @default(10)
+  requestCooldownSeconds    Int       @default(10)
   /// Spec 007 : une cuisine séparée signale les commandes prêtes au serveur (étape « Prête »).
-  separateKitchen           Boolean @default(false)
+  separateKitchen           Boolean   @default(false)
   /// Spec 012, R7 : rangée « Souvent pris avec » dans la fiche d'un plat (désactivée par défaut).
-  pairingsEnabled           Boolean @default(false)
-  createdAt DateTime  @default(now()) @db.Timestamptz(3)
-  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
-  archivedAt DateTime? @db.Timestamptz(3)
+  pairingsEnabled           Boolean   @default(false)
+  /// Spec 027, R8 et R12 : centre de la zone de l'établissement (NULL = pas de zone, aucune position demandée).
+  zoneLatitude              Float?
+  zoneLongitude             Float?
+  /// Rayon de la zone, en mètres (50 à 500).
+  zoneRadiusM               Int       @default(150)
+  /// Délai sans activité avant l'alerte de départ sans payer, en minutes (10 à 60).
+  unpaidAlertMinutes        Int       @default(20)
+  createdAt                 DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt                 DateTime  @updatedAt @db.Timestamptz(3)
+  archivedAt                DateTime? @db.Timestamptz(3)
 
   tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   memberships     Membership[]
@@ -131,6 +162,7 @@ model Establishment {
   escalationRules EscalationRule[]
   menuCategories  MenuCategory[]
   menuItems       MenuItem[]
+  unpaidAlerts    UnpaidAlert[]
 
   @@index([tenantId])
 }
@@ -151,10 +183,10 @@ model User {
   createdAt          DateTime   @default(now()) @db.Timestamptz(3)
   updatedAt          DateTime   @updatedAt @db.Timestamptz(3)
 
-  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  memberships     Membership[]
-  refreshSessions RefreshSession[]
-  notifications   Notification[]
+  tenant           Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  memberships      Membership[]
+  refreshSessions  RefreshSession[]
+  notifications    Notification[]
   assignedRequests ServiceRequest[] @relation("RequestAssignee")
 
   @@index([tenantId])
@@ -181,14 +213,14 @@ model Role {
 
 /// Périmètre d'accès explicite : un utilisateur, un établissement, un rôle.
 model Membership {
-  id              String   @id @default(uuid()) @db.Uuid
-  tenantId        String   @db.Uuid
-  userId          String   @db.Uuid
-  establishmentId String   @db.Uuid
-  roleId          String   @db.Uuid
+  id                 String   @id @default(uuid()) @db.Uuid
+  tenantId           String   @db.Uuid
+  userId             String   @db.Uuid
+  establishmentId    String   @db.Uuid
+  roleId             String   @db.Uuid
   /// Spec 010 : permissions du rôle retirées à cet employé. Effectives = rôle − retirées ; jamais au-delà du rôle.
   revokedPermissions String[] @default([])
-  createdAt       DateTime @default(now()) @db.Timestamptz(3)
+  createdAt          DateTime @default(now()) @db.Timestamptz(3)
 
   user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   establishment Establishment @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
@@ -200,15 +232,15 @@ model Membership {
 
 /// Session d'authentification (refresh token haché, rotation par famille).
 model RefreshSession {
-  id         String    @id @default(uuid()) @db.Uuid
-  userId     String    @db.Uuid
-  familyId   String    @db.Uuid
-  tokenHash  String    @unique
-  userAgent  String?
-  ip         String?
-  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
-  expiresAt  DateTime  @db.Timestamptz(3)
-  revokedAt  DateTime? @db.Timestamptz(3)
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  familyId  String    @db.Uuid
+  tokenHash String    @unique
+  userAgent String?
+  ip        String?
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  expiresAt DateTime  @db.Timestamptz(3)
+  revokedAt DateTime? @db.Timestamptz(3)
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -280,24 +312,32 @@ model QrCode {
 
 /// Session de table ouverte par un scan. Le jeton n'est stocké que haché (SHA-256).
 model TableSession {
-  id              String        @id @default(uuid()) @db.Uuid
-  tenantId        String        @db.Uuid
-  establishmentId String        @db.Uuid
-  tableId         String        @db.Uuid
-  qrCodeId        String        @db.Uuid
-  tokenHash       String        @unique
-  status          SessionStatus @default(open)
-  requestCount    Int           @default(0)
-  lastRequestAt   DateTime?     @db.Timestamptz(3)
-  openedAt        DateTime      @default(now()) @db.Timestamptz(3)
-  expiresAt       DateTime      @db.Timestamptz(3)
-  closedAt        DateTime?     @db.Timestamptz(3)
-  closedById      String?       @db.Uuid
+  id                String        @id @default(uuid()) @db.Uuid
+  tenantId          String        @db.Uuid
+  establishmentId   String        @db.Uuid
+  tableId           String        @db.Uuid
+  qrCodeId          String        @db.Uuid
+  tokenHash         String        @unique
+  status            SessionStatus @default(open)
+  requestCount      Int           @default(0)
+  lastRequestAt     DateTime?     @db.Timestamptz(3)
+  openedAt          DateTime      @default(now()) @db.Timestamptz(3)
+  expiresAt         DateTime      @db.Timestamptz(3)
+  closedAt          DateTime?     @db.Timestamptz(3)
+  closedById        String?       @db.Uuid
+  /// Spec 027, R2 : repère de la session (index dans le catalogue). Unique parmi les sessions ouvertes
+  /// d'une table (index partiel SQL, migration session_par_client).
+  markerIndex       Int           @default(0)
+  /// Spec 027, R9 : dernière commande, demande ou règlement de la session.
+  lastActivityAt    DateTime      @default(now()) @db.Timestamptz(3)
+  /// Spec 027, R9 : « Client encore là » — pas de nouvelle alerte avant cette heure.
+  alertSnoozedUntil DateTime?     @db.Timestamptz(3)
 
   establishment Establishment    @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
   table         DiningTable      @relation(fields: [tableId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
   qrCode        QrCode           @relation(fields: [qrCodeId], references: [id], onDelete: Restrict)
   requests      ServiceRequest[]
+  unpaidAlerts  UnpaidAlert[]
 
   @@index([tableId, status])
   @@index([status, expiresAt])
@@ -315,6 +355,8 @@ model RequestType {
   /// Délai cible de prise en charge (acceptation), en secondes. Au-delà, la demande est « en retard ».
   slaSeconds      Int             @default(180)
   allowNote       Boolean         @default(true)
+  /// Spec 027, R6 : demande propre à chaque client (« L'addition »), pas regroupée par table.
+  perSession      Boolean         @default(false)
   isActive        Boolean         @default(true)
   position        Int             @default(0)
   createdAt       DateTime        @default(now()) @db.Timestamptz(3)
@@ -365,13 +407,20 @@ model ServiceRequest {
   escalatedAt      DateTime?        @db.Timestamptz(3)
   /// Spec 026 : commande servie réglée par le client. Axe distinct du statut ; NULL = à régler.
   paidAt           DateTime?        @db.Timestamptz(3)
+  /// Spec 027, R8 : résultat de la vérification de zone (NULL = pas de zone). Aucune coordonnée du client.
+  zoneCheck        ZoneCheck?
+  /// Distance arrondie à la zone, en mètres, quand le client est hors zone.
+  zoneDistanceM    Int?
+  /// Spec 027, R9 : « Parti sans payer ». La commande sort du reste à encaisser.
+  writtenOffAt     DateTime?        @db.Timestamptz(3)
+  writtenOffById   String?          @db.Uuid
 
-  establishment Establishment       @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
-  table         DiningTable         @relation(fields: [tableId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
-  requestType   RequestType         @relation(fields: [requestTypeId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
-  area          DiningArea          @relation(fields: [areaId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
-  session       TableSession?       @relation(fields: [sessionId], references: [id], onDelete: Restrict)
-  assignee      User?               @relation("RequestAssignee", fields: [assigneeId], references: [id], onDelete: Restrict)
+  establishment Establishment         @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  table         DiningTable           @relation(fields: [tableId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
+  requestType   RequestType           @relation(fields: [requestTypeId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
+  area          DiningArea            @relation(fields: [areaId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
+  session       TableSession?         @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  assignee      User?                 @relation("RequestAssignee", fields: [assigneeId], references: [id], onDelete: Restrict)
   assignments   ServiceAssignment[]
   events        ServiceRequestEvent[]
   items         ServiceRequestItem[]
@@ -565,11 +614,11 @@ model MenuImage {
 /// Ligne d'une commande. Nom et prix sont figés à la commande : modifier la carte ensuite
 /// ne réécrit pas l'historique.
 model ServiceRequestItem {
-  id              String  @id @default(uuid()) @db.Uuid
-  tenantId        String  @db.Uuid
-  establishmentId String  @db.Uuid
-  requestId       String  @db.Uuid
-  menuItemId      String  @db.Uuid
+  id              String @id @default(uuid()) @db.Uuid
+  tenantId        String @db.Uuid
+  establishmentId String @db.Uuid
+  requestId       String @db.Uuid
+  menuItemId      String @db.Uuid
   name            String
   unitPriceMinor  Int
   quantity        Int
@@ -577,4 +626,27 @@ model ServiceRequestItem {
   request ServiceRequest @relation(fields: [requestId], references: [id], onDelete: Restrict)
 
   @@index([requestId])
+}
+
+/// Spec 027, R9 : alerte de départ sans payer, traitée par le gérant.
+/// Une seule alerte ouverte par session (index partiel SQL, migration session_par_client).
+model UnpaidAlert {
+  id              String                 @id @default(uuid()) @db.Uuid
+  tenantId        String                 @db.Uuid
+  establishmentId String                 @db.Uuid
+  tableId         String                 @db.Uuid
+  sessionId       String                 @db.Uuid
+  /// Montant servi et non réglé de la session au moment de l'alerte.
+  amountMinor     Int
+  reason          UnpaidAlertReason
+  createdAt       DateTime               @default(now()) @db.Timestamptz(3)
+  resolvedAt      DateTime?              @db.Timestamptz(3)
+  resolution      UnpaidAlertResolution?
+  resolvedById    String?                @db.Uuid
+
+  establishment Establishment @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  session       TableSession  @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+
+  @@index([establishmentId, resolvedAt])
+  @@index([sessionId])
 }

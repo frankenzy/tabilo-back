@@ -8,6 +8,7 @@ import { randomToken } from '../../commons/utils/crypto';
 import { conflict, notFound } from '../../commons/utils/errors';
 import { OutboxService } from '../outbox/outbox.service';
 import { ACTIVE_STATUSES } from '../service-requests/request-lifecycle';
+import { raiseUnpaidAlerts } from '../unpaid-alerts/unpaid-alerts';
 
 export interface TableView {
   id: string;
@@ -58,6 +59,18 @@ export interface OccupationOrderView {
   /** Spec 022 : précisions du client (note composée), ou null. */
   note: string | null;
   items: { menuItemId: string; name: string; quantity: number; unitPriceMinor: number; imageId: string | null }[];
+  /** Spec 027 : session du client qui a commandé (null pour une commande saisie par le personnel). */
+  sessionId: string | null;
+  /** Spec 027, R9 : marquée « Parti sans payer ». */
+  writtenOffAt: string | null;
+}
+
+/** Spec 027, R3 : un client de la table (sa session), avec son repère et ce qu'il reste à régler. */
+export interface OccupationSessionView {
+  id: string;
+  marker: number;
+  status: 'open' | 'settled' | 'closed' | 'expired';
+  unpaidMinor: number;
 }
 
 /** Spec 020, R2 et R4 : ce que la fiche d'une table montre de son occupation. */
@@ -77,6 +90,8 @@ export interface TableOccupationView {
   lastOccupiedAt: string | null;
   /** Commandes de l'occupation, la plus récente d'abord ; vide si la table est libre. */
   orders: OccupationOrderView[];
+  /** Spec 027, R3 : clients de l'occupation (sessions ouvertes ou ayant commandé), dans l'ordre d'arrivée. */
+  sessions: OccupationSessionView[];
 }
 
 export interface QrView {
@@ -175,7 +190,7 @@ export class FloorService {
         CASE WHEN o.since IS NULL THEN NULL ELSE (
           SELECT coalesce(sum(r."totalMinor"), 0)::int FROM "ServiceRequest" r
           WHERE r."tableId" = t.id AND r."establishmentId" = t."establishmentId"
-            AND r."totalMinor" IS NOT NULL AND r.status = 'resolved' AND r."paidAt" IS NULL AND r."createdAt" >= o.since
+            AND r."totalMinor" IS NOT NULL AND r.status = 'resolved' AND r."paidAt" IS NULL AND r."writtenOffAt" IS NULL AND r."createdAt" >= o.since
         ) END AS "unpaidMinor"
       FROM "DiningTable" t
       JOIN "DiningArea" a ON a.id = t."areaId" AND a."archivedAt" IS NULL
@@ -210,7 +225,7 @@ export class FloorService {
     const where = { ...this.where(scope), tableId };
     const now = new Date();
     const [sessions, oldestActive] = await Promise.all([
-      this.prisma.tableSession.findMany({ where: { ...where, status: 'open', expiresAt: { gt: now } }, select: { openedAt: true } }),
+      this.prisma.tableSession.findMany({ where: { ...where, status: 'open', expiresAt: { gt: now } }, select: { id: true, openedAt: true } }),
       this.prisma.serviceRequest.findFirst({
         where: { ...where, status: { in: [...ACTIVE_STATUSES] } },
         orderBy: { createdAt: 'asc' },
@@ -231,7 +246,7 @@ export class FloorService {
         FROM "Establishment" est
         WHERE est.id = ${scope.establishmentId}::uuid AND est."tenantId" = ${scope.tenantId}::uuid`;
       const last = row?.last && row.last >= row.dayStart ? row.last.toISOString() : null;
-      return { tableId, currency, occupiedSince: null, openSessions: 0, amountMinor: null, unpaidMinor: null, lastOccupiedAt: last, orders: [] };
+      return { tableId, currency, occupiedSince: null, openSessions: 0, amountMinor: null, unpaidMinor: null, lastOccupiedAt: last, orders: [], sessions: [] };
     }
 
     const requests = await this.prisma.serviceRequest.findMany({
@@ -239,11 +254,19 @@ export class FloorService {
       orderBy: { createdAt: 'desc' },
       take: 50,
       select: {
-        id: true, status: true, createdAt: true, resolvedAt: true, paidAt: true, totalMinor: true, note: true,
+        id: true, status: true, createdAt: true, resolvedAt: true, paidAt: true, totalMinor: true, note: true, sessionId: true, writtenOffAt: true,
         items: { select: { menuItemId: true, name: true, quantity: true, unitPriceMinor: true }, orderBy: { name: 'asc' } },
       },
     });
     const menuIds = [...new Set(requests.flatMap((request) => request.items.map((item) => item.menuItemId)))];
+    const due = (request: (typeof requests)[number]) => request.status === 'resolved' && !request.paidAt && !request.writtenOffAt;
+    // Spec 027, R3 : les clients de l'occupation — téléphones encore ouverts et sessions qui ont commandé.
+    const sessionIds = [...new Set([...sessions.map((session) => session.id), ...requests.map((request) => request.sessionId).filter((id): id is string => !!id)])];
+    const sessionRows = await this.prisma.tableSession.findMany({
+      where: { id: { in: sessionIds }, ...this.where(scope) },
+      orderBy: { openedAt: 'asc' },
+      select: { id: true, markerIndex: true, status: true },
+    });
     const images = new Map(
       (await this.prisma.menuItem.findMany({ where: { id: { in: menuIds }, ...this.where(scope) }, select: { id: true, imageId: true } })).map((item) => [item.id, item.imageId]),
     );
@@ -253,7 +276,7 @@ export class FloorService {
       occupiedSince: since.toISOString(),
       openSessions: sessions.length,
       amountMinor: requests.filter((request) => request.status !== 'cancelled').reduce((sum, request) => sum + (request.totalMinor ?? 0), 0),
-      unpaidMinor: requests.filter((request) => request.status === 'resolved' && !request.paidAt).reduce((sum, request) => sum + (request.totalMinor ?? 0), 0),
+      unpaidMinor: requests.filter(due).reduce((sum, request) => sum + (request.totalMinor ?? 0), 0),
       lastOccupiedAt: null,
       orders: requests.map((request) => ({
         id: request.id,
@@ -264,6 +287,14 @@ export class FloorService {
         totalMinor: request.totalMinor ?? 0,
         note: request.note,
         items: request.items.map((item) => ({ ...item, imageId: images.get(item.menuItemId) ?? null })),
+        sessionId: request.sessionId,
+        writtenOffAt: request.writtenOffAt?.toISOString() ?? null,
+      })),
+      sessions: sessionRows.map((session) => ({
+        id: session.id,
+        marker: session.markerIndex,
+        status: session.status,
+        unpaidMinor: requests.filter((request) => request.sessionId === session.id && due(request)).reduce((sum, request) => sum + (request.totalMinor ?? 0), 0),
       })),
     };
   }
@@ -415,6 +446,8 @@ export class FloorService {
     });
     if (open.length === 0) return 0;
     const sessionIds = open.map((s) => s.id);
+    // Spec 027, R9 : libérer une table avec un reste à régler crée une alerte par client concerné.
+    await raiseUnpaidAlerts(tx, this.outbox, sessionIds, 'released');
     await tx.tableSession.updateMany({
       where: { id: { in: sessionIds } },
       data: { status: 'closed', closedAt: new Date(), closedById: scope.userId },

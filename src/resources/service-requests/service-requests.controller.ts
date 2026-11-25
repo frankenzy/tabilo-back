@@ -8,6 +8,7 @@ import {
   ListRequestsQuery,
   OptionalReasonDto,
   ReasonDto,
+  SettleSessionDto,
   SettleTableDto,
 } from './dto';
 import { ServiceRequestsService } from './service-requests.service';
@@ -38,6 +39,14 @@ export class ServiceRequestsController {
   @ApiOperation({ summary: "Régler les commandes servies non réglées de l'occupation d'une table (spec 026)" })
   settleTable(@CurrentScope() scope: Scope, @Body() dto: SettleTableDto) {
     return this.requests.settleTable(scope, dto.tableId);
+  }
+
+  @Post('settle-session')
+  @HttpCode(200)
+  @RequirePermissions('requests.handle')
+  @ApiOperation({ summary: "Régler les commandes servies non réglées d'un client (spec 027)" })
+  settleSession(@CurrentScope() scope: Scope, @Body() dto: SettleSessionDto) {
+    return this.requests.settleSession(scope, dto.sessionId);
   }
 
   @Get(':id')

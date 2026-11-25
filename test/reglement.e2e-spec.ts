@@ -22,25 +22,32 @@ describe('Spec 026 — règlement des commandes', () => {
       prices[priceMinor] = item.body.id as string;
     }
     const table = await createTable(t, owner, '3');
-    const guest = await openSession(t, table.code);
+    let guest = await openSession(t, table.code);
+    /** Spec 027, R4 : une session réglée est terminée ; le client suivant (ou le même) en ouvre une nouvelle. */
+    async function currentGuest(): Promise<Guest> {
+      const probe = await t.http.get('/api/v1/guest/session').set(guest.headers);
+      if (probe.status === 401) guest = await openSession(t, table.code);
+      return guest;
+    }
     const act = (account: Account, id: string, action: string) => t.http.post(`${account.base}/requests/${id}/${action}`).set(account.auth).send({});
 
     /** Commande de la table 3 : servie, en préparation, ou servie puis réglée. */
     async function order(priceMinor: number, state: 'served' | 'preparing' | 'paid') {
-      const res = await t.http.post('/api/v1/guest/orders').set(guest.headers).send({ items: [{ menuItemId: prices[priceMinor], quantity: 1 }] }).expect(200);
+      const res = await t.http.post('/api/v1/guest/orders').set((await currentGuest()).headers).send({ items: [{ menuItemId: prices[priceMinor], quantity: 1 }] }).expect(200);
       const id = res.body.request.id as string;
       await act(owner, id, 'prepare').expect(200);
       if (state !== 'preparing') await act(owner, id, 'resolve').expect(200);
       if (state === 'paid') await act(owner, id, 'settle').expect(200);
       return id;
     }
-    return { owner, table, guest, order, act };
+    return { owner, table, guest, order, act, currentGuest };
   }
 
   const settleTable = (owner: Account, table: Floor) => t.http.post(`${owner.base}/requests/settle-table`).set(owner.auth).send({ tableId: table.tableId });
   const occupation = async (owner: Account, table: Floor) =>
     (await t.http.get(`${owner.base}/tables/${table.tableId}/occupation`).set(owner.auth).expect(200)).body as {
       openSessions: number;
+      occupiedSince: string | null;
       unpaidMinor: number | null;
       orders: { id: string; paidAt: string | null }[];
     };
@@ -95,15 +102,17 @@ describe('Spec 026 — règlement des commandes', () => {
     expect((await settleTable(owner, table).expect(409)).body.code).toBe('NOTHING_TO_SETTLE');
   });
 
-  it('CA-026-04 — régler ne libère pas la table : le client recommande', async () => {
-    const { owner, table, guest, order } = await shop('Règlement sans départ');
+  // Révisé par la spec 027, R4 : régler termine la session ; le client qui recommande en ouvre une nouvelle.
+  it('CA-026-04 — après règlement, la table se libère et le client recommande dans une nouvelle session', async () => {
+    const { owner, table, guest, order, currentGuest } = await shop('Règlement sans départ');
     await order(3000, 'served');
     await settleTable(owner, table).expect(200);
-    expect((await occupation(owner, table)).openSessions).toBe(1);
+    expect((await occupation(owner, table)).occupiedSince).toBeNull();
+    expect((await t.http.get('/api/v1/guest/session').set(guest.headers).expect(401)).body.code).toBe('TABLE_SESSION_SETTLED');
     const again = await order(2000, 'served');
     const after = await occupation(owner, table);
     expect(after.unpaidMinor).toBe(2000);
-    expect((await guestRequests(guest)).find((r) => r.id === again)?.paidAt).toBeNull();
+    expect((await guestRequests(await currentGuest())).find((r) => r.id === again)?.paidAt).toBeNull();
   });
 
   it('CA-026-05 — libérer avec un reste : les commandes non réglées restent à encaisser', async () => {
@@ -125,9 +134,10 @@ describe('Spec 026 — règlement des commandes', () => {
   });
 
   it('CA-026-07 — le client voit ses commandes réglées', async () => {
-    const { guest, order } = await shop('Ma note réglée');
-    const paid = await order(3000, 'paid');
+    const { owner, guest, order, act } = await shop('Ma note réglée');
+    const paid = await order(3000, 'served');
     const unpaid = await order(2000, 'served');
+    await act(owner, paid, 'settle').expect(200);
     const mine = new Map((await guestRequests(guest)).map((r) => [r.id, r.paidAt]));
     expect(mine.get(paid)).not.toBeNull();
     expect(mine.get(unpaid)).toBeNull();

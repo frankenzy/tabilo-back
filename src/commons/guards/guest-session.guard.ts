@@ -12,17 +12,26 @@ export class GuestSessionResolver {
   constructor(private readonly prisma: PrismaService) {}
 
   async resolve(token: unknown): Promise<GuestSession | null> {
+    const result = await this.inspect(token);
+    return result === 'settled' || result === null ? null : result;
+  }
+
+  /** Comme `resolve`, mais distingue une session réglée (spec 027, R4) d'une session invalide. */
+  async inspect(token: unknown): Promise<GuestSession | 'settled' | null> {
     if (typeof token !== 'string' || token.length < 32 || token.length > 128) return null;
     const session = await this.prisma.tableSession.findUnique({
       where: { tokenHash: hashToken(token) },
-      select: { id: true, tenantId: true, establishmentId: true, tableId: true, status: true, expiresAt: true },
+      select: { id: true, tenantId: true, establishmentId: true, tableId: true, status: true, expiresAt: true, markerIndex: true },
     });
-    if (!session || session.status !== 'open' || session.expiresAt <= new Date()) return null;
+    if (!session) return null;
+    if (session.status === 'settled') return 'settled';
+    if (session.status !== 'open' || session.expiresAt <= new Date()) return null;
     return {
       id: session.id,
       tenantId: session.tenantId,
       establishmentId: session.establishmentId,
       tableId: session.tableId,
+      markerIndex: session.markerIndex,
     };
   }
 }
@@ -37,7 +46,11 @@ export class GuestSessionGuard implements CanActivate {
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<AppRequest>();
-    const guest = await this.resolver.resolve(request.headers[SESSION_HEADER]);
+    const guest = await this.resolver.inspect(request.headers[SESSION_HEADER]);
+    if (guest === 'settled') {
+      // Spec 027, R4 : le téléphone affiche « Réglé · Merci » et propose une nouvelle session.
+      throw unauthorized('TABLE_SESSION_SETTLED', 'Votre note est réglée. Merci !');
+    }
     if (!guest) {
       throw unauthorized('TABLE_SESSION_INVALID', 'Session de table expirée. Scannez à nouveau le QR code.');
     }

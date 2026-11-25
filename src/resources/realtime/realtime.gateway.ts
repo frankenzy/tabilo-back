@@ -10,7 +10,7 @@ import { GuestSessionResolver } from '../../commons/guards/guest-session.guard';
 import { PrismaService } from '../../commons/prisma/prisma.service';
 import { DomainEvent, OutboxService } from '../outbox/outbox.service';
 import { ServiceRequestsService } from '../service-requests/service-requests.service';
-import { toGuestRequestView, toRequestView } from '../service-requests/request.views';
+import { isPerSession, toGuestRequestView, toRequestView } from '../service-requests/request.views';
 
 const staffRoom = (establishmentId: string) => `est:${establishmentId}`;
 const tableRoom = (tableId: string) => `table:${tableId}`;
@@ -96,11 +96,19 @@ export class RealtimeGateway implements OnGatewayInit, OnModuleInit {
 
   private async broadcast(event: DomainEvent, tx: Parameters<ServiceRequestsService['loadForBroadcast']>[0]) {
     if (!this.server) return;
-    if (event.type === 'session.closed') {
+    if (event.type === 'session.closed' || event.type === 'session.settled') {
       for (const sessionId of event.sessionIds ?? []) {
-        this.server.to(sessionRoom(sessionId)).emit('session.closed', { eventId: event.eventId });
+        // Spec 027, R4 : « session.settled » fait afficher « Réglé · Merci » au téléphone.
+        this.server.to(sessionRoom(sessionId)).emit(event.type, { eventId: event.eventId });
         this.server.in(sessionRoom(sessionId)).disconnectSockets(true);
       }
+      // Le personnel rafraîchit la vue « Tables » et la fiche de table.
+      this.server.to(staffRoom(event.establishmentId)).emit('session.changed', { eventId: event.eventId, type: event.type });
+      return;
+    }
+    if (event.type === 'alert.changed') {
+      // Spec 027, R9 : identifiant seulement ; le tableau de bord relit les alertes avec ses droits.
+      this.server.to(staffRoom(event.establishmentId)).emit('alert.changed', { eventId: event.eventId, alertId: event.alertId });
       return;
     }
     if (!event.requestId) return;
@@ -114,7 +122,9 @@ export class RealtimeGateway implements OnGatewayInit, OnModuleInit {
       request: toRequestView(request),
     });
     if (event.type !== 'request.escalated' && event.type !== 'request.escalation_acknowledged') {
-      this.server.to(tableRoom(request.tableId)).emit('request.changed', {
+      // Spec 027, R1 : une commande (ou « L'addition ») ne va qu'au téléphone de son client.
+      const room = isPerSession(request) && request.sessionId ? sessionRoom(request.sessionId) : tableRoom(request.tableId);
+      this.server.to(room).emit('request.changed', {
         ...envelope,
         request: toGuestRequestView(request),
       });

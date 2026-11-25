@@ -3,7 +3,8 @@ import type { Tx } from '../../commons/prisma/prisma.service';
 const DEFAULT_REQUEST_TYPES = [
   { label: 'Appeler un serveur', icon: 'bell', slaSeconds: 180, priority: 'normal' as const },
   { label: "De l'eau", icon: 'droplet', slaSeconds: 180, priority: 'normal' as const },
-  { label: "L'addition", icon: 'receipt', slaSeconds: 240, priority: 'normal' as const },
+  // Spec 027, R6 : chaque client demande sa propre addition.
+  { label: "L'addition", icon: 'receipt', slaSeconds: 240, priority: 'normal' as const, perSession: true },
   { label: 'Assistance', icon: 'life-buoy', slaSeconds: 120, priority: 'high' as const },
   { label: 'Autre demande', icon: 'message-circle', slaSeconds: 240, priority: 'normal' as const },
 ];
