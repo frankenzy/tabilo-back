@@ -185,11 +185,12 @@ const BRANDS: Brand[] = [
 ];
 
 const REQUEST_TYPES = [
-  { label: 'Appeler un serveur', icon: 'bell', slaSeconds: 180, priority: 'normal' as const },
+  // Spec 029, R1 : l'appel et le message, les deux ronds du bouton « Serveur ».
+  { label: 'Appeler un serveur', kind: 'call' as const, icon: 'bell', slaSeconds: 180, priority: 'normal' as const, allowNote: false },
   { label: "De l'eau", icon: 'droplet', slaSeconds: 180, priority: 'normal' as const },
   { label: "L'addition", kind: 'bill' as const, perSession: true, icon: 'receipt', slaSeconds: 240, priority: 'normal' as const },
   { label: 'Assistance', icon: 'life-buoy', slaSeconds: 120, priority: 'high' as const },
-  { label: 'Autre demande', icon: 'message-circle', slaSeconds: 240, priority: 'normal' as const },
+  { label: 'Message', kind: 'message' as const, icon: 'message-circle', slaSeconds: 240, priority: 'normal' as const, perSession: true, allowNote: true },
 ];
 
 const SEATS = [2, 4, 4, 4, 6, 8];

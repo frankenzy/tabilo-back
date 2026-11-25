@@ -100,6 +100,10 @@ enum RequestTypeKind {
   order
   /// Spec 028 : « L'addition », demande de facture d'un client. Un seul type de ce genre par établissement.
   bill
+  /// Spec 029 : « Appel », le client appelle un serveur d'un toucher. Un seul par établissement.
+  call
+  /// Spec 029 : « Message », le client écrit au personnel. Un seul par établissement.
+  message
 }
 
 enum EscalationTrigger {

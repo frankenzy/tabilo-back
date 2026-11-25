@@ -108,12 +108,14 @@ function typeOf(request: RequestWithRelations): RequestView['type'] {
  * ou une demande propre au client (« L'addition ») ; les autres demandes de service restent communes à la table.
  */
 export function isPerSession(request: RequestWithRelations): boolean {
-  return request.sessionId !== null && (request.requestType.kind !== 'service' || request.requestType.perSession);
+  // Spec 029 : l'appel reste commun à la table ; le message ne va qu'au téléphone qui l'a écrit.
+  const shared = request.requestType.kind === 'service' || request.requestType.kind === 'call';
+  return request.sessionId !== null && (!shared || request.requestType.perSession);
 }
 
 /**
  * Vue destinée au client à table : le strict nécessaire au suivi.
- * Ni note (qui peut venir d'un autre téléphone), ni nom complet du personnel, ni données internes.
+ * Ni note (qui peut venir d'un autre téléphone ; seul le message, propre à son auteur, rend la sienne), ni nom complet du personnel, ni données internes.
  * Spec 027, R1 : le client ne voit que les commandes de sa session ; les demandes de service communes restent visibles de la table.
  */
 export interface GuestRequestView {
@@ -131,6 +133,8 @@ export interface GuestRequestView {
   cancelledAt: string | null;
   /** Spec 026, R8 : commande réglée. */
   paidAt: string | null;
+  /** Spec 029, R5 : le texte d'un message, rendu au seul téléphone qui l'a écrit. */
+  note: string | null;
 }
 
 export function toGuestRequestView(request: RequestWithRelations): GuestRequestView {
@@ -150,5 +154,6 @@ export function toGuestRequestView(request: RequestWithRelations): GuestRequestV
     resolvedAt: iso(request.resolvedAt),
     cancelledAt: iso(request.cancelledAt),
     paidAt: iso(request.paidAt),
+    note: request.requestType.kind === 'message' ? request.note : null,
   };
 }
