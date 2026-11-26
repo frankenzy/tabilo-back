@@ -9,7 +9,13 @@ export const REQUEST_INCLUDE = {
   // Spec 027, R2 : repère de la session qui a passé la demande.
   session: { select: { markerIndex: true } },
   assignee: { select: { id: true, firstName: true, lastName: true } },
-  items: { select: { menuItemId: true, name: true, quantity: true, unitPriceMinor: true }, orderBy: { name: 'asc' } },
+  items: {
+    select: {
+      id: true, menuItemId: true, name: true, quantity: true, unitPriceMinor: true, choices: true, options: true, listPriceMinor: true,
+      offer: { select: { createdAt: true } },
+    },
+    orderBy: { name: 'asc' },
+  },
 } satisfies Prisma.ServiceRequestInclude;
 
 export type RequestWithRelations = Prisma.ServiceRequestGetPayload<{ include: typeof REQUEST_INCLUDE }>;
@@ -20,6 +26,14 @@ export interface OrderLineView {
   name: string;
   quantity: number;
   unitPriceMinor: number;
+  /** Spec 032, R5 : choix d'une formule, figés à la commande ; null pour un plat. */
+  choices: Prisma.JsonValue | null;
+  /** Spec 038, R5 : options choisies, figées ; null sans option. */
+  options: Prisma.JsonValue | null;
+  /** Spec 033 : identifiant de la ligne (pour l'offrir), prix de la carte si promotion, ligne offerte. */
+  id: string;
+  listPriceMinor: number | null;
+  offeredAt: Date | null;
 }
 
 /** Vue destinée au personnel. */
@@ -64,6 +78,11 @@ export interface RequestView {
 
 const iso = (date: Date | null): string | null => (date ? date.toISOString() : null);
 
+/** Spec 033 : une ligne offerte porte la date de son « Offert » (table à part, la ligne restant figée). */
+function toLineView({ offer, ...line }: RequestWithRelations['items'][number]): OrderLineView {
+  return { ...line, offeredAt: offer?.createdAt ?? null };
+}
+
 export function toRequestView(request: RequestWithRelations, bill?: BillSummary): RequestView {
   return {
     id: request.id,
@@ -76,7 +95,7 @@ export function toRequestView(request: RequestWithRelations, bill?: BillSummary)
     table: request.table,
     area: request.area,
     type: typeOf(request),
-    items: request.items,
+    items: request.items.map(toLineView),
     totalMinor: request.totalMinor,
     assignee: request.assignee,
     version: request.version,
@@ -144,7 +163,7 @@ export function toGuestRequestView(request: RequestWithRelations): GuestRequestV
     // Spec 007, Q2 : le client reste sur « En préparation » jusqu'au service.
     status: request.status === 'ready' ? 'in_progress' : request.status,
     type: typeOf(request),
-    items: request.items,
+    items: request.items.map(toLineView),
     totalMinor: request.totalMinor,
     quantity: request.quantity,
     handledBy: handled && request.assignee ? request.assignee.firstName : null,

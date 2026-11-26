@@ -8,6 +8,8 @@ import { EscalationService } from '../resources/escalation/escalation.service';
 import { DomainEvent, OutboxService } from '../resources/outbox/outbox.service';
 import { closeBillRequests } from '../resources/service-requests/bill';
 import { raiseUnpaidAlerts, UnpaidAlertsService } from '../resources/unpaid-alerts/unpaid-alerts';
+import { SubscriptionService } from '../resources/subscription/subscription';
+import { PrivacyService } from '../resources/privacy/privacy';
 
 const QUEUE = 'tabilo-escalation';
 
@@ -43,6 +45,8 @@ export class TasksService implements OnModuleInit, OnApplicationShutdown {
     private readonly outbox: OutboxService,
     private readonly escalation: EscalationService,
     private readonly unpaidAlerts: UnpaidAlertsService,
+    private readonly subscriptions: SubscriptionService,
+    private readonly privacy: PrivacyService,
   ) {}
 
   onModuleInit(): void {
@@ -138,6 +142,28 @@ export class TasksService implements OnModuleInit, OnApplicationShutdown {
       await raiseUnpaidAlerts(tx, this.outbox, ids, 'expired');
       // Spec 028, R6 : une demande d'addition ne survit pas à sa session.
       await closeBillRequests(tx, this.outbox, ids, 'expired', { type: 'system', id: null });
+      // Spec 030, R8 : une commande jamais encaissée ne survit pas à sa session.
+      const unpaid = await tx.serviceRequest.findMany({ where: { sessionId: { in: ids }, status: 'awaiting_payment', paidAt: null } });
+      for (const request of unpaid) {
+        const updated = await tx.serviceRequest.updateMany({
+          where: { id: request.id, status: 'awaiting_payment', version: request.version },
+          data: { status: 'cancelled', cancelledAt: now, version: { increment: 1 } },
+        });
+        if (updated.count !== 1) continue;
+        await tx.serviceRequestEvent.create({
+          data: {
+            tenantId: request.tenantId,
+            establishmentId: request.establishmentId,
+            requestId: request.id,
+            type: 'request.cancelled',
+            fromStatus: 'awaiting_payment',
+            toStatus: 'cancelled',
+            actorType: 'system',
+            payload: { reason: 'session_expired' },
+          },
+        });
+        await this.outbox.add(tx, request, 'request.cancelled', { requestId: request.id, actorId: null });
+      }
       await tx.tableSession.updateMany({ where: { id: { in: ids }, status: 'open' }, data: { status: 'expired', closedAt: now } });
       return true;
     });
@@ -150,6 +176,21 @@ export class TasksService implements OnModuleInit, OnApplicationShutdown {
   async sweepUnpaidAlerts(): Promise<void> {
     if (this.skip()) return;
     await this.guard('alertes impayés', () => this.unpaidAlerts.sweep());
+  }
+
+  /** Spec 035, R4 : passage des comptes à échéance (en retard, puis suspendus), chaque heure ; rattrape un passage manqué. */
+  @Interval(3_600_000)
+  async sweepAccounts(): Promise<void> {
+    if (this.skip()) return;
+    await this.guard('abonnements', () => this.subscriptions.sweep());
+  }
+
+  /** Spec 041, R4 et R6 : effacement des comptes fermés arrivés à terme, purge des données personnelles inutiles. */
+  @Interval(3_600_000)
+  async sweepPrivacy(): Promise<void> {
+    if (this.skip()) return;
+    await this.guard('effacements', () => this.privacy.eraseDue());
+    await this.guard('purge des données personnelles', () => this.privacy.purge());
   }
 
   /** Purge quotidienne des données techniques sans valeur d'historique. */

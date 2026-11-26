@@ -23,7 +23,8 @@
     "prisma:deploy": "prisma migrate deploy",
     "seed:demo": "ts-node prisma/seed-demo.ts",
     "seed:demo-photos": "ts-node prisma/seed-demo-photos.ts",
-    "seed:test": "ts-node prisma/seed-test.ts"
+    "seed:test": "ts-node prisma/seed-test.ts",
+    "platform:create-admin": "ts-node prisma/create-platform-admin.ts"
   },
   "jest": {
     "moduleFileExtensions": [

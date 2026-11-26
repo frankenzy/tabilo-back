@@ -4,6 +4,7 @@ import type { RequestStatus } from '@prisma/client';
  * Machine à états des demandes. Seule référence des transitions autorisées :
  * tout changement de statut passe par `assertTransition`, côté serveur.
  *
+ *   awaiting_payment → in_progress (encaissée, spec 030) | cancelled
  *   pending     → assigned | cancelled
  *   assigned    → accepted | pending (libération justifiée)
  *   accepted    → in_progress | cancelled (selon permissions)
@@ -15,6 +16,7 @@ import type { RequestStatus } from '@prisma/client';
  * peut être en cours de traitement et escaladée.
  */
 export const TRANSITIONS: Readonly<Record<RequestStatus, readonly RequestStatus[]>> = {
+  awaiting_payment: ['in_progress', 'cancelled'],
   pending: ['assigned', 'cancelled'],
   assigned: ['accepted', 'pending'],
   accepted: ['in_progress', 'cancelled'],
@@ -25,7 +27,7 @@ export const TRANSITIONS: Readonly<Record<RequestStatus, readonly RequestStatus[
 };
 
 export const TERMINAL_STATUSES: readonly RequestStatus[] = ['resolved', 'cancelled'];
-export const ACTIVE_STATUSES: readonly RequestStatus[] = ['pending', 'assigned', 'accepted', 'in_progress', 'ready'];
+export const ACTIVE_STATUSES: readonly RequestStatus[] = ['awaiting_payment', 'pending', 'assigned', 'accepted', 'in_progress', 'ready'];
 
 export function canTransition(from: RequestStatus, to: RequestStatus): boolean {
   return TRANSITIONS[from].includes(to);

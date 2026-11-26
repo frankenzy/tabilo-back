@@ -1,16 +1,46 @@
-import { Prisma } from '@prisma/client';
+import { Prisma, ServiceRequest } from '@prisma/client';
 import type { Tx } from '../../commons/prisma/prisma.service';
 import type { OutboxService } from '../outbox/outbox.service';
 import { ACTIVE_STATUSES } from './request-lifecycle';
+
+/** Statuts où une commande « Régler quand on veut » se règle déjà (spec 030, R4). */
+const IN_SERVICE = ['pending', 'assigned', 'accepted', 'in_progress', 'ready'] as const;
+
+/**
+ * Spec 030 : une commande se règle si elle n'est ni réglée ni « Parti sans payer », et si elle est servie,
+ * à encaisser (« Caisse d'abord »), ou en cours avec la façon de servir « Régler quand on veut ».
+ * Seule définition du reste à régler : à combiner par `AND` (elle porte son propre `OR`).
+ */
+export const PAYABLE = {
+  totalMinor: { not: null },
+  paidAt: null,
+  writtenOffAt: null,
+  OR: [
+    { status: { in: ['resolved', 'awaiting_payment'] } },
+    { serviceMode: 'pay_anytime', status: { in: [...IN_SERVICE] } },
+  ],
+} satisfies Prisma.ServiceRequestWhereInput;
+
+/** Même règle que `PAYABLE`, en SQL, pour une demande aliasée `r`. */
+export const PAYABLE_SQL = Prisma.sql`(r."totalMinor" IS NOT NULL AND r."paidAt" IS NULL AND r."writtenOffAt" IS NULL
+  AND (r.status IN ('resolved', 'awaiting_payment')
+    OR (r."serviceMode" = 'pay_anytime' AND r.status IN ('pending', 'assigned', 'accepted', 'in_progress', 'ready'))))`;
+
+/** Même règle que `PAYABLE`, sur une demande déjà chargée. */
+export function isPayable(request: Pick<ServiceRequest, 'totalMinor' | 'paidAt' | 'writtenOffAt' | 'status' | 'serviceMode'>): boolean {
+  if (request.totalMinor === null || request.paidAt || request.writtenOffAt) return false;
+  if (request.status === 'resolved' || request.status === 'awaiting_payment') return true;
+  return request.serviceMode === 'pay_anytime' && (IN_SERVICE as readonly string[]).includes(request.status);
+}
 
 /** Spec 028, R6 : comment une demande d'addition s'est close. */
 export type BillCloseReason = 'settled' | 'released' | 'expired' | 'walked_out';
 
 /** Spec 028, R5 : ce que la carte « Demande d'addition » montre au personnel. */
 export interface BillSummary {
-  /** Commandes servies, non réglées et non marquées impayées de la session. */
+  /** Ce qui se règle dans la session (`PAYABLE`) : commandes servies non réglées, et en cours selon la façon de servir. */
   dueMinor: number;
-  /** Commandes de la session pas encore servies, donc pas encore comptées. */
+  /** Commandes de la session en cours et pas encore comptées. */
   pendingOrders: number;
 }
 
@@ -23,12 +53,12 @@ export async function billSummaries(db: Reader, sessionIds: string[]): Promise<M
   const [due, pending] = await Promise.all([
     db.serviceRequest.groupBy({
       by: ['sessionId'],
-      where: { sessionId: { in: sessionIds }, status: 'resolved', totalMinor: { not: null }, paidAt: null, writtenOffAt: null },
+      where: { sessionId: { in: sessionIds }, AND: [PAYABLE] },
       _sum: { totalMinor: true },
     }),
     db.serviceRequest.groupBy({
       by: ['sessionId'],
-      where: { sessionId: { in: sessionIds }, status: { in: [...ACTIVE_STATUSES] }, totalMinor: { not: null } },
+      where: { sessionId: { in: sessionIds }, status: { in: [...ACTIVE_STATUSES] }, totalMinor: { not: null }, NOT: PAYABLE },
       _count: { _all: true },
     }),
   ]);

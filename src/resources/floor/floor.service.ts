@@ -2,12 +2,13 @@ import { Inject, Injectable } from '@nestjs/common';
 import * as QRCode from 'qrcode';
 import { APP_ENV, AppEnv } from '../../commons/config/env';
 import { PrismaService, Tx } from '../../commons/prisma/prisma.service';
+import { PlanService } from '../../commons/services/plan.service';
 import { AuditService } from '../../commons/services/audit.service';
 import type { Scope } from '../../commons/types';
 import { randomToken } from '../../commons/utils/crypto';
 import { conflict, notFound } from '../../commons/utils/errors';
 import { OutboxService } from '../outbox/outbox.service';
-import { closeBillRequests } from '../service-requests/bill';
+import { closeBillRequests, isPayable, PAYABLE_SQL } from '../service-requests/bill';
 import { ACTIVE_STATUSES } from '../service-requests/request-lifecycle';
 import { raiseUnpaidAlerts } from '../unpaid-alerts/unpaid-alerts';
 
@@ -98,7 +99,10 @@ export interface TableOccupationView {
 export interface QrView {
   tableId: string;
   tableLabel: string;
+  areaId: string;
   areaName: string;
+  /** Spec 042, R5 : dernière impression ; null = à imprimer. */
+  printedAt: string | null;
   url: string;
   /** SVG vectoriel. Le PNG est rastérisé par le navigateur : l'encoder ici bloquerait l'API. */
   svg: string;
@@ -113,6 +117,7 @@ export class FloorService {
     private readonly audit: AuditService,
     private readonly outbox: OutboxService,
     @Inject(APP_ENV) private readonly env: AppEnv,
+    private readonly plans: PlanService,
   ) {}
 
   // ------------------------------------------------------------------ zones
@@ -177,7 +182,7 @@ export class FloorService {
           SELECT r."tableId", r."createdAt" AS since
           FROM "ServiceRequest" r
           WHERE r."establishmentId" = ${scope.establishmentId}::uuid AND r."tenantId" = ${scope.tenantId}::uuid
-            AND r.status IN ('pending', 'assigned', 'accepted', 'in_progress', 'ready')
+            AND r.status IN ('awaiting_payment', 'pending', 'assigned', 'accepted', 'in_progress', 'ready')
         ) starts
         GROUP BY "tableId"
       )
@@ -191,7 +196,7 @@ export class FloorService {
         CASE WHEN o.since IS NULL THEN NULL ELSE (
           SELECT coalesce(sum(r."totalMinor"), 0)::int FROM "ServiceRequest" r
           WHERE r."tableId" = t.id AND r."establishmentId" = t."establishmentId"
-            AND r."totalMinor" IS NOT NULL AND r.status = 'resolved' AND r."paidAt" IS NULL AND r."writtenOffAt" IS NULL AND r."createdAt" >= o.since
+            AND ${PAYABLE_SQL} AND r."createdAt" >= o.since
         ) END AS "unpaidMinor"
       FROM "DiningTable" t
       JOIN "DiningArea" a ON a.id = t."areaId" AND a."archivedAt" IS NULL
@@ -256,11 +261,19 @@ export class FloorService {
       take: 50,
       select: {
         id: true, status: true, createdAt: true, resolvedAt: true, paidAt: true, totalMinor: true, note: true, sessionId: true, writtenOffAt: true,
-        items: { select: { menuItemId: true, name: true, quantity: true, unitPriceMinor: true }, orderBy: { name: 'asc' } },
+        serviceMode: true,
+        items: {
+          select: {
+            id: true, menuItemId: true, name: true, quantity: true, unitPriceMinor: true, choices: true, options: true, listPriceMinor: true,
+            offer: { select: { createdAt: true } },
+          },
+          orderBy: { name: 'asc' },
+        },
       },
     });
     const menuIds = [...new Set(requests.flatMap((request) => request.items.map((item) => item.menuItemId)))];
-    const due = (request: (typeof requests)[number]) => request.status === 'resolved' && !request.paidAt && !request.writtenOffAt;
+    // Spec 030 : même règle que le règlement.
+    const due = (request: (typeof requests)[number]) => isPayable(request);
     // Spec 027, R3 : les clients de l'occupation — téléphones encore ouverts et sessions qui ont commandé.
     const sessionIds = [...new Set([...sessions.map((session) => session.id), ...requests.map((request) => request.sessionId).filter((id): id is string => !!id)])];
     const sessionRows = await this.prisma.tableSession.findMany({
@@ -287,7 +300,7 @@ export class FloorService {
         paidAt: request.paidAt?.toISOString() ?? null,
         totalMinor: request.totalMinor ?? 0,
         note: request.note,
-        items: request.items.map((item) => ({ ...item, imageId: images.get(item.menuItemId) ?? null })),
+        items: request.items.map(({ offer, ...item }) => ({ ...item, offeredAt: offer?.createdAt.toISOString() ?? null, imageId: images.get(item.menuItemId) ?? null })),
         sessionId: request.sessionId,
         writtenOffAt: request.writtenOffAt?.toISOString() ?? null,
       })),
@@ -345,6 +358,8 @@ export class FloorService {
 
   async createTable(scope: Scope, dto: { areaId: string; label: string; seats?: number }) {
     await this.findArea(scope, dto.areaId);
+    // Spec 034, R3 : tables de l'établissement dans la limite de la formule.
+    await this.plans.assertLimit(scope.tenantId, 'tablesPerEstablishment', scope.establishmentId);
     await this.assertLabelFree(scope, dto.label);
     return this.prisma.$transaction(async (tx) => {
       const table = await tx.diningTable.create({
@@ -392,24 +407,38 @@ export class FloorService {
   async qrCodes(scope: Scope, tableId?: string): Promise<QrView[]> {
     const codes = await this.prisma.qrCode.findMany({
       where: { ...this.where(scope), status: 'active', tableId, table: { archivedAt: null } },
-      include: { table: { select: { label: true, area: { select: { name: true } } } } },
+      include: { table: { select: { label: true, area: { select: { id: true, name: true } } } } },
     });
     const collator = new Intl.Collator('fr', { numeric: true });
     codes.sort((a, b) => collator.compare(a.table.label, b.table.label));
     return Promise.all(
       codes.map(async (qr) => {
         const url = `${this.env.publicWebUrl}/t/${qr.code}`;
-        const svg = await QRCode.toString(url, { type: 'svg', errorCorrectionLevel: 'M', margin: 2 });
+        // Spec 042, R3 : correction d'erreur H, pour rester lisible avec le logo posé au centre.
+        const svg = await QRCode.toString(url, { type: 'svg', errorCorrectionLevel: 'H', margin: 2 });
         return {
           tableId: qr.tableId,
           tableLabel: qr.table.label,
+          areaId: qr.table.area.id,
           areaName: qr.table.area.name,
+          printedAt: qr.printedAt?.toISOString() ?? null,
           url,
           svg,
           createdAt: qr.createdAt.toISOString(),
         };
       }),
     );
+  }
+
+  /** Spec 042, R5 : marque imprimés les QR actifs des tables données. */
+  async markPrinted(scope: Scope, tableIds: string[]): Promise<{ printed: number }> {
+    const now = new Date();
+    const updated = await this.prisma.qrCode.updateMany({ where: { ...this.where(scope), status: 'active', tableId: { in: tableIds } }, data: { printedAt: now } });
+    await this.audit.record({
+      action: 'qr.printed', tenantId: scope.tenantId, establishmentId: scope.establishmentId, actorId: scope.userId,
+      metadata: { tables: updated.count }, ip: scope.ip,
+    });
+    return { printed: updated.count };
   }
 
   /** Remplace le QR d'une table : l'ancien est révoqué et ses sessions ouvertes sont fermées. */

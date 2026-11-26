@@ -24,6 +24,10 @@ import { ServiceRequestsModule } from './resources/service-requests/service-requ
 import { StaffModule } from './resources/staff/staff.module';
 import { TasksModule } from './tasks/tasks.module';
 import { UnpaidAlertsModule } from './resources/unpaid-alerts/unpaid-alerts';
+import { PlatformModule } from './resources/platform/platform';
+import { SubscriptionModule } from './resources/subscription/subscription';
+import { PrivacyModule } from './resources/privacy/privacy';
+import { LoyaltyModule } from './resources/loyalty/loyalty';
 
 /**
  * Monolithe modulaire. Ordre des gardes globaux : limitation de débit, puis accès
@@ -51,6 +55,10 @@ import { UnpaidAlertsModule } from './resources/unpaid-alerts/unpaid-alerts';
     AnalyticsModule,
     UnpaidAlertsModule,
     AuditLogsModule,
+    SubscriptionModule,
+    PlatformModule,
+    PrivacyModule,
+    LoyaltyModule,
     TasksModule,
     HealthModule,
   ],

@@ -7,7 +7,7 @@ import { APP_ENV, AppEnv } from '../../commons/config/env';
 import { CurrentUser, Public } from '../../commons/decorators';
 import type { AuthUser } from '../../commons/types';
 import { AuthService, ClientContext, IssuedTokens } from './auth.service';
-import { ChangePasswordDto, LoginDto, RegisterDto } from './dto';
+import { ChangePasswordDto, LoginDto, RegisterDto, ResetPasswordDto } from './dto';
 
 const REFRESH_COOKIE = 'tabilo_rt';
 const COOKIE_PATH = '/api/v1/auth';
@@ -32,6 +32,15 @@ export class AuthController {
   @ApiOperation({ summary: 'Créer un compte client (tenant + établissement + propriétaire)' })
   async register(@Body() dto: RegisterDto, @Req() req: FastifyRequest, @Res({ passthrough: true }) reply: FastifyReply) {
     return this.respond(await this.auth.register(dto, this.client(req)), reply);
+  }
+
+  /** Spec 036, R5 : lien à usage unique donné par l'éditeur ; toutes les sessions du compte sont fermées. */
+  @Public()
+  @Throttle(rateLimit(10, 900_000))
+  @Post('reset-password')
+  @HttpCode(204)
+  async resetPassword(@Body() dto: ResetPasswordDto, @Req() req: FastifyRequest): Promise<void> {
+    await this.auth.resetPassword(dto, this.client(req));
   }
 
   @Public()

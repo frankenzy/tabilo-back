@@ -1,12 +1,16 @@
 import { Injectable } from '@nestjs/common';
-import { ActorType, Prisma, RequestStatus, RequestTypeKind, ServiceRequest } from '@prisma/client';
+import { ActorType, Prisma, RequestStatus, RequestTypeKind, ServiceMode, ServiceRequest } from '@prisma/client';
 import { PrismaService, Tx } from '../../commons/prisma/prisma.service';
+import { PlanService } from '../../commons/services/plan.service';
 import { can, GuestSession, Scope } from '../../commons/types';
 import { conflict, forbidden, notFound, tooMany, unprocessable } from '../../commons/utils/errors';
 import { Page, skipTake, toPage } from '../../commons/utils/pagination';
 import { ClientLocation, evaluateZone, ZoneResult } from '../../commons/utils/zone';
+import { inSlots, readSlots } from '../../commons/utils/slots';
+import { stampSession } from '../loyalty/loyalty-stamp';
+import { AuditService } from '../../commons/services/audit.service';
 import { DomainEventType, OutboxService } from '../outbox/outbox.service';
-import { billSummaries, closeBillRequests } from './bill';
+import { billSummaries, closeBillRequests, isPayable, PAYABLE } from './bill';
 import { AssignRequestDto, CreateStaffRequestDto, ListRequestsQuery } from './dto';
 import { ACTIVE_STATUSES, canTransition, TERMINAL_STATUSES } from './request-lifecycle';
 import {
@@ -19,6 +23,7 @@ import {
 } from './request.views';
 
 const STATUS_LABELS: Record<RequestStatus, string> = {
+  awaiting_payment: 'à encaisser',
   pending: 'en attente',
   assigned: 'affectée',
   accepted: 'acceptée',
@@ -56,6 +61,25 @@ export interface RequestEventView {
 export interface OrderLineInput {
   menuItemId: string;
   quantity: number;
+  /** Spec 032 : un plat par rubrique, pour une formule. */
+  choices?: { groupId: string; menuItemId: string }[];
+  /** Spec 038 : options choisies. */
+  options?: string[];
+}
+
+/** Spec 038, R5 : option choisie, figée sur la ligne de commande. */
+export interface FrozenOption {
+  group: string;
+  optionId: string;
+  name: string;
+  priceMinor: number;
+}
+
+/** Spec 032, R5 : choix d'une formule, figés sur la ligne de commande. */
+export interface FrozenChoice {
+  group: string;
+  menuItemId: string;
+  name: string;
 }
 
 /** Ce qu'un client peut créer : une demande de service, ou une commande depuis la carte. */
@@ -75,6 +99,10 @@ interface ResolvedLine {
   name: string;
   unitPriceMinor: number;
   quantity: number;
+  choices?: FrozenChoice[];
+  options?: FrozenOption[];
+  /** Spec 033, R1 et R7 : prix de la carte quand la ligne est commandée en promotion. */
+  listPriceMinor?: number | null;
 }
 
 export interface GuestCreateResult {
@@ -90,6 +118,8 @@ export class ServiceRequestsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly outbox: OutboxService,
+    private readonly audit: AuditService,
+    private readonly plans: PlanService,
   ) {}
 
   // ---------------------------------------------------------------- lecture
@@ -105,11 +135,8 @@ export class ServiceRequestsService {
     };
     if (query.status) where.status = query.status;
     else if (query.scope === 'unpaid') {
-      // Spec 026 : commandes servies non réglées.
-      where.status = 'resolved';
-      where.totalMinor = { not: null };
-      where.paidAt = null;
-      where.writtenOffAt = null; // Spec 027, R9 : « Parti sans payer » sort de la liste.
+      // Spec 026 et 030 : ce qui reste à régler (« Parti sans payer » en sort, spec 027, R9).
+      where.AND = [PAYABLE];
     } else if (query.scope === 'active') where.status = { in: [...ACTIVE_STATUSES] };
     else if (query.scope === 'closed') where.status = { in: [...TERMINAL_STATUSES] };
     if (query.late) {
@@ -252,6 +279,9 @@ export class ServiceRequestsService {
         if (duplicate && type.kind !== 'message') return { id: duplicate.id, deduplicated: true };
         // Spec 028, R2 : l'addition ne se demande que s'il y a quelque chose à régler.
         if (type.kind === 'bill') {
+          // Spec 030, R8 : en « Caisse d'abord », tout est réglé avant d'être servi.
+          const { serviceMode } = await tx.establishment.findUniqueOrThrow({ where: { id: guest.establishmentId }, select: { serviceMode: true } });
+          if (serviceMode === 'pay_first') throw unprocessable('BILL_DISABLED', "On règle à la caisse avant d'être servi.");
           const summary = (await billSummaries(tx, [guest.id])).get(guest.id);
           if (!summary?.dueMinor) throw unprocessable('NOTHING_TO_PAY', "Rien à régler pour l'instant.");
         }
@@ -266,7 +296,7 @@ export class ServiceRequestsService {
           where: { id: guest.establishmentId },
           select: {
             maxActiveRequestsPerTable: true, maxRequestsPerSession: true, requestCooldownSeconds: true,
-            zoneLatitude: true, zoneLongitude: true, zoneRadiusM: true,
+            zoneLatitude: true, zoneLongitude: true, zoneRadiusM: true, serviceMode: true, autoStartOrders: true,
           },
         }),
         tx.diningTable.findFirst({
@@ -300,6 +330,9 @@ export class ServiceRequestsService {
         idempotencyKey,
         // Spec 027, R8 : seule une commande porte le signalement de zone. Les coordonnées ne sont pas transmises plus loin.
         zone: input.kind === 'order' ? evaluateZone(establishment, input.location ?? null) : null,
+        // Spec 030, R2 : une commande garde la façon de servir de son envoi.
+        serviceMode: input.kind === 'order' ? establishment.serviceMode : null,
+        autoStart: input.kind === 'order' && establishment.autoStartOrders,
       });
       const now = new Date();
       await tx.tableSession.update({
@@ -353,7 +386,9 @@ export class ServiceRequestsService {
         },
       });
       if (!current) throw this.requestNotFound();
-      if (current.status !== 'pending') {
+      // Spec 030, R5 et R6 : annulable en attente ou à encaisser, jamais une fois réglée.
+      if (current.paidAt) throw conflict('PAID_CANNOT_CANCEL', 'Cette commande est déjà réglée.');
+      if (current.status !== 'pending' && current.status !== 'awaiting_payment') {
         throw conflict('REQUEST_ALREADY_HANDLED', 'Cette demande est déjà prise en charge.');
       }
       // Spec 028 : l'addition demandée se clôt d'elle-même, au règlement ou à la fin de session.
@@ -456,18 +491,24 @@ export class ServiceRequestsService {
         actor: staffActor(scope),
       });
       await this.closeAssignment(tx, current.id);
+      // Spec 030, R10 : réglée avant d'être servie, la commande servie peut terminer la session.
+      if (current.paidAt) await this.endSessionIfDone(tx, current.sessionId);
     });
   }
 
-  /** Spec 026, R1 : régler une commande servie. Une seule personne réussit si deux règlent en même temps. */
+  /**
+   * Spec 026, R1 et spec 030 : régler une commande (servie, ou selon sa façon de servir). Encaisser une commande
+   * « à encaisser » la fait partir en préparation (spec 030, R7). Une seule personne réussit si deux règlent en même temps.
+   */
   async settle(scope: Scope, id: string): Promise<RequestView> {
     return this.mutate(scope, id, async (tx, current) => {
       if (current.totalMinor === null) throw unprocessable('NOT_AN_ORDER', 'Seule une commande se règle.');
-      if (current.status !== 'resolved') {
+      if (current.writtenOffAt) throw conflict('WRITTEN_OFF', 'Commande marquée « Parti sans payer ».');
+      if (current.paidAt) throw conflict('ALREADY_PAID', 'Déjà réglée.');
+      if (!isPayable(current)) {
         throw conflict('NOT_SERVED', `Action impossible : la commande est ${STATUS_LABELS[current.status]}, pas encore servie.`);
       }
-      if (current.writtenOffAt) throw conflict('WRITTEN_OFF', 'Commande marquée « Parti sans payer ».');
-      if (!(await this.markPaid(tx, current, staffActor(scope)))) throw conflict('ALREADY_PAID', 'Déjà réglée.');
+      if (!(await this.payOrder(tx, current, staffActor(scope)))) throw conflict('ALREADY_PAID', 'Déjà réglée.');
       await this.afterPayment(tx, current.sessionId, scope.userId);
     });
   }
@@ -503,13 +544,11 @@ export class ServiceRequestsService {
 
   /** Règle les commandes servies non réglées d'une session, dans la transaction de l'appelant. */
   async settleSessionTx(tx: Tx, sessionId: string, actor: Actor): Promise<{ settled: number; amountMinor: number }> {
-    const unpaid = await tx.serviceRequest.findMany({
-      where: { sessionId, status: 'resolved', totalMinor: { not: null }, paidAt: null, writtenOffAt: null },
-    });
+    const unpaid = await tx.serviceRequest.findMany({ where: { sessionId, AND: [PAYABLE] } });
     let settled = 0;
     let amountMinor = 0;
     for (const request of unpaid) {
-      if (await this.markPaid(tx, request, actor)) {
+      if (await this.payOrder(tx, request, actor)) {
         settled += 1;
         amountMinor += request.totalMinor ?? 0;
       }
@@ -536,13 +575,13 @@ export class ServiceRequestsService {
       const starts = [session?.openedAt, active?.createdAt].filter((date): date is Date => !!date).map((date) => date.getTime());
       if (starts.length === 0) throw conflict('NOTHING_TO_SETTLE', 'La table est libre : rien à régler.');
       const unpaid = await tx.serviceRequest.findMany({
-        where: { ...where, status: 'resolved', totalMinor: { not: null }, paidAt: null, writtenOffAt: null, createdAt: { gte: new Date(Math.min(...starts)) } },
+        where: { ...where, AND: [PAYABLE], createdAt: { gte: new Date(Math.min(...starts)) } },
       });
       if (unpaid.length === 0) throw conflict('NOTHING_TO_SETTLE', 'Rien à régler sur cette table.');
       let settled = 0;
       let amountMinor = 0;
       for (const request of unpaid) {
-        if (await this.markPaid(tx, request, staffActor(scope))) {
+        if (await this.payOrder(tx, request, staffActor(scope))) {
           settled += 1;
           amountMinor += request.totalMinor ?? 0;
         }
@@ -558,6 +597,8 @@ export class ServiceRequestsService {
 
   async cancel(scope: Scope, id: string, reason?: string): Promise<RequestView> {
     return this.mutate(scope, id, async (tx, current) => {
+      // Spec 030, R5 : une commande réglée ne s'annule plus.
+      if (current.paidAt) throw conflict('PAID_CANNOT_CANCEL', 'Cette commande est déjà réglée.');
       await this.step(tx, current, 'cancelled', { cancelledAt: new Date() }, {
         eventType: 'request.cancelled',
         actor: staffActor(scope),
@@ -566,6 +607,96 @@ export class ServiceRequestsService {
       await this.closeAssignment(tx, current.id);
       await this.endSessionIfDone(tx, current.sessionId);
     });
+  }
+
+  /**
+   * Spec 033, R4 et R5 : offrir une ligne entière d'une commande non réglée (elle vaut alors 0), ou retirer le cadeau.
+   * Le total de la commande est recalculé : addition, règlement et ventes restent justes (R7). Journalisé (R8).
+   */
+  async offerLine(scope: Scope, id: string, itemId: string, offered: boolean): Promise<RequestView> {
+    // Spec 034, R4 : le geste « Offert » fait partie des promotions.
+    await this.plans.assertFeature(scope.tenantId, 'promotions');
+    return this.mutate(scope, id, async (tx, current) => {
+      if (current.totalMinor === null) throw unprocessable('NOT_AN_ORDER', 'Seule une ligne de commande peut être offerte.');
+      if (current.paidAt || current.writtenOffAt || current.status === 'cancelled') {
+        throw conflict('ORDER_CLOSED', 'Commande réglée ou annulée : on ne peut plus offrir.');
+      }
+      const lines = await tx.serviceRequestItem.findMany({ where: { requestId: current.id }, include: { offer: { select: { id: true } } } });
+      const line = lines.find((candidate) => candidate.id === itemId);
+      if (!line) throw notFound('ORDER_LINE_NOT_FOUND', 'Ligne introuvable.');
+      if (offered === (line.offer !== null)) {
+        throw conflict(offered ? 'ALREADY_OFFERED' : 'NOT_OFFERED', offered ? 'Cette ligne est déjà offerte.' : "Cette ligne n'est pas offerte.");
+      }
+      // La ligne reste figée (append-only) : l'« Offert » vit dans sa propre table.
+      if (offered) {
+        await tx.serviceRequestItemOffer.create({
+          data: { tenantId: current.tenantId, establishmentId: current.establishmentId, requestId: current.id, itemId: line.id, offeredById: scope.userId },
+        });
+      } else {
+        await tx.serviceRequestItemOffer.delete({ where: { itemId: line.id } });
+      }
+      const totalMinor = lines.reduce((sum, candidate) => {
+        const isOffered = candidate.id === line.id ? offered : candidate.offer !== null;
+        return isOffered ? sum : sum + candidate.unitPriceMinor * candidate.quantity;
+      }, 0);
+      const updated = await tx.serviceRequest.updateMany({
+        where: { id: current.id, version: current.version, paidAt: null },
+        data: { totalMinor, version: { increment: 1 } },
+      });
+      if (updated.count !== 1) throw conflict('REQUEST_STATE_CONFLICT', "La commande vient d'être modifiée par quelqu'un d'autre.");
+      const amountMinor = line.unitPriceMinor * line.quantity;
+      const table = await tx.diningTable.findUnique({ where: { id: current.tableId }, select: { label: true } });
+      await tx.serviceRequestEvent.create({
+        data: {
+          tenantId: current.tenantId, establishmentId: current.establishmentId, requestId: current.id,
+          type: 'request.offered', actorType: 'staff', actorId: scope.userId,
+          payload: { itemId: line.id, name: line.name, amountMinor, offered },
+        },
+      });
+      await this.audit.record(
+        {
+          action: offered ? 'order_line.offered' : 'order_line.unoffered',
+          tenantId: scope.tenantId, establishmentId: scope.establishmentId, actorId: scope.userId,
+          entityType: 'ServiceRequest', entityId: current.id,
+          metadata: { table: table?.label ?? null, item: line.name, amountMinor },
+          ip: scope.ip,
+        },
+        tx,
+      );
+      await this.outbox.add(tx, current, 'request.offered', { requestId: current.id, actorId: scope.userId });
+    });
+  }
+
+  /**
+   * Spec 043, R4 : la récompense de fidélité devient une commande offerte de la session, qui suit le circuit habituel
+   * (préparation, service). Sa ligne vaut 0 et porte « Offert ».
+   */
+  async createRewardOrder(tx: Tx, sessionId: string, itemId: string, actor: Actor): Promise<string> {
+    const session = await tx.tableSession.findUniqueOrThrow({ where: { id: sessionId }, select: { tenantId: true, establishmentId: true, tableId: true } });
+    const [type, table, item] = await Promise.all([
+      this.loadOrderType(tx, session.establishmentId),
+      tx.diningTable.findUniqueOrThrow({ where: { id: session.tableId }, select: { id: true, areaId: true } }),
+      tx.menuItem.findFirst({ where: { id: itemId, establishmentId: session.establishmentId, archivedAt: null }, select: { id: true, name: true, priceMinor: true } }),
+    ]);
+    if (!item) throw unprocessable('MENU_ITEM_NOT_FOUND', "La récompense n'est plus à la carte.");
+    const created = await this.insert(tx, {
+      scope: { tenantId: session.tenantId, establishmentId: session.establishmentId },
+      table,
+      type,
+      note: 'Récompense de fidélité',
+      lines: [{ menuItemId: item.id, name: item.name, unitPriceMinor: item.priceMinor, quantity: 1 }],
+      source: 'staff',
+      actor,
+      sessionId,
+      idempotencyKey: null,
+    });
+    const [line] = await tx.serviceRequestItem.findMany({ where: { requestId: created.id }, select: { id: true } });
+    await tx.serviceRequestItemOffer.create({
+      data: { tenantId: session.tenantId, establishmentId: session.establishmentId, requestId: created.id, itemId: line.id, offeredById: actor.id },
+    });
+    // Rien à payer : la commande offerte est réglée d'emblée et ne retient pas la fin de la session.
+    await tx.serviceRequest.update({ where: { id: created.id }, data: { totalMinor: 0, paidAt: new Date() } });
+    return created.id;
   }
 
   /** Libérer une demande affectée (assigned → pending). Le motif est obligatoire. */
@@ -744,10 +875,24 @@ export class ServiceRequestsService {
     return tx.serviceRequest.findUniqueOrThrow({ where: { id: current.id } });
   }
 
-  /** Spec 026 : marque une commande servie réglée ; false si elle l'était déjà (ou a changé entre-temps). */
+  /**
+   * Spec 030, R7 : règle une commande ; une commande « à encaisser » part ensuite en préparation,
+   * sans personne affectée. false si elle était déjà réglée (ou a changé entre-temps).
+   */
+  private async payOrder(tx: Tx, request: ServiceRequest, actor: Actor): Promise<boolean> {
+    if (!(await this.markPaid(tx, request, actor))) return false;
+    if (request.status === 'awaiting_payment') {
+      const paid = await tx.serviceRequest.findUniqueOrThrow({ where: { id: request.id } });
+      const now = new Date();
+      await this.step(tx, paid, 'in_progress', { acceptedAt: now, startedAt: now }, { eventType: 'request.started', actor });
+    }
+    return true;
+  }
+
+  /** Spec 026 et 030 : marque réglée une commande qui se règle ; false si elle l'était déjà (ou a changé entre-temps). */
   private async markPaid(tx: Tx, request: ServiceRequest, actor: Actor): Promise<boolean> {
     const updated = await tx.serviceRequest.updateMany({
-      where: { id: request.id, establishmentId: request.establishmentId, status: 'resolved', paidAt: null, writtenOffAt: null },
+      where: { id: request.id, establishmentId: request.establishmentId, status: request.status, AND: [PAYABLE] },
       data: { paidAt: new Date(), version: { increment: 1 } },
     });
     if (updated.count !== 1) return false;
@@ -776,9 +921,9 @@ export class ServiceRequestsService {
    */
   private async afterPayment(tx: Tx, sessionId: string | null, actorId: string | null): Promise<void> {
     if (!sessionId) return;
-    const due = await tx.serviceRequest.count({
-      where: { sessionId, status: 'resolved', totalMinor: { not: null }, paidAt: null, writtenOffAt: null },
-    });
+    // Spec 043, R3 : un tampon de fidélité par visite réglée.
+    await stampSession(tx, sessionId);
+    const due = await tx.serviceRequest.count({ where: { sessionId, AND: [PAYABLE] } });
     if (due === 0) {
       // Spec 028, R6 : plus rien à régler, la demande d'addition est close.
       await closeBillRequests(tx, this.outbox, [sessionId], 'settled', { type: actorId ? 'staff' : 'system', id: actorId });
@@ -801,7 +946,7 @@ export class ServiceRequestsService {
     const orders = { sessionId, totalMinor: { not: null } } satisfies Prisma.ServiceRequestWhereInput;
     const [active, due, paid, writtenOff] = await Promise.all([
       tx.serviceRequest.count({ where: { sessionId, status: { in: [...ACTIVE_STATUSES] } } }),
-      tx.serviceRequest.count({ where: { ...orders, status: 'resolved', paidAt: null, writtenOffAt: null } }),
+      tx.serviceRequest.count({ where: { sessionId, AND: [PAYABLE] } }),
       tx.serviceRequest.count({ where: { ...orders, paidAt: { not: null } } }),
       tx.serviceRequest.count({ where: { ...orders, writtenOffAt: { not: null } } }),
     ]);
@@ -894,10 +1039,16 @@ export class ServiceRequestsService {
       sessionId: string | null;
       idempotencyKey: string | null;
       zone?: ZoneResult | null;
+      serviceMode?: ServiceMode | null;
+      autoStart?: boolean;
     },
   ): Promise<ServiceRequest> {
     const now = new Date();
     const lines = input.lines ?? [];
+    // Spec 030 : à encaisser d'abord (R6), en préparation tout de suite (R9), ou en attente.
+    const status: RequestStatus =
+      input.serviceMode === 'pay_first' ? 'awaiting_payment' : input.autoStart ? 'in_progress' : 'pending';
+    const started = status === 'in_progress' ? now : null;
     const created = await tx.serviceRequest.create({
       data: {
         tenantId: input.scope.tenantId,
@@ -915,17 +1066,23 @@ export class ServiceRequestsService {
         totalMinor: lines.length > 0 ? lines.reduce((sum, line) => sum + line.unitPriceMinor * line.quantity, 0) : null,
         zoneCheck: input.zone?.zoneCheck ?? null,
         zoneDistanceM: input.zone?.zoneDistanceM ?? null,
+        serviceMode: input.serviceMode ?? null,
+        status,
+        acceptedAt: started,
+        startedAt: started,
         createdAt: now,
         dueAt: new Date(now.getTime() + input.type.slaSeconds * 1000),
       },
     });
     if (lines.length > 0) {
       await tx.serviceRequestItem.createMany({
-        data: lines.map((line) => ({
+        data: lines.map(({ choices, options, ...line }) => ({
           tenantId: created.tenantId,
           establishmentId: created.establishmentId,
           requestId: created.id,
           ...line,
+          choices: choices ? (choices as unknown as Prisma.InputJsonArray) : Prisma.DbNull,
+          options: options?.length ? (options as unknown as Prisma.InputJsonArray) : Prisma.DbNull,
         })),
       });
     }
@@ -935,7 +1092,7 @@ export class ServiceRequestsService {
         establishmentId: created.establishmentId,
         requestId: created.id,
         type: 'request.created',
-        toStatus: 'pending',
+        toStatus: status,
         actorType: input.actor.type,
         actorId: input.actor.id,
         payload: { source: input.source },
@@ -967,26 +1124,110 @@ export class ServiceRequestsService {
    * Transforme les lignes envoyées par le client en lignes de commande. Le client ne fournit
    * que des identifiants et des quantités : nom et prix viennent de la carte, relue en base,
    * et l'article doit appartenir à CET établissement.
+   * Spec 032 : une formule garde une ligne par composition ; chaque rubrique reçoit exactement un plat proposé et disponible.
    */
   private async resolveLines(tx: Tx, establishmentId: string, items: OrderLineInput[]): Promise<ResolvedLine[]> {
-    const quantities = new Map<string, number>();
-    for (const item of items) quantities.set(item.menuItemId, (quantities.get(item.menuItemId) ?? 0) + item.quantity);
-    const found = await tx.menuItem.findMany({
-      where: { id: { in: [...quantities.keys()] }, establishmentId, archivedAt: null, category: { archivedAt: null } },
-      select: { id: true, name: true, priceMinor: true, isAvailable: true },
-    });
-    if (found.length !== quantities.size) {
+    const ids = new Set<string>();
+    for (const item of items) {
+      ids.add(item.menuItemId);
+      item.choices?.forEach((choice) => ids.add(choice.menuItemId));
+    }
+    const [found, { timezone }] = await Promise.all([
+      tx.menuItem.findMany({
+        where: { id: { in: [...ids] }, establishmentId, archivedAt: null, category: { archivedAt: null } },
+        select: {
+          id: true, name: true, priceMinor: true, promoPriceMinor: true, isAvailable: true, isBundle: true,
+          promoSlots: true, availabilitySlots: true,
+          bundleGroups: { orderBy: { position: 'asc' }, select: { id: true, name: true, choiceIds: true } },
+          optionGroups: {
+            orderBy: { position: 'asc' },
+            select: { id: true, name: true, multiple: true, required: true, options: { select: { id: true, name: true, priceMinor: true, isAvailable: true } } },
+          },
+        },
+      }),
+      tx.establishment.findUniqueOrThrow({ where: { id: establishmentId }, select: { timezone: true } }),
+    ]);
+    // Spec 039, R4 : prix et disponibilité au moment où l'API reçoit la commande, au fuseau de l'établissement.
+    const now = new Date();
+    const open = (slots: unknown) => {
+      const list = readSlots(slots);
+      return !list || inSlots(list, now, timezone);
+    };
+    const byId = new Map(found.map((item) => [item.id, item]));
+    const ordered = items.map((item) => byId.get(item.menuItemId));
+    if (ordered.some((item) => !item)) {
       throw unprocessable('MENU_ITEM_NOT_FOUND', "Un article n'est plus à la carte. Actualisez la page.");
     }
-    const unavailable = found.find((item) => !item.isAvailable);
+    const unavailable = ordered.find((item) => !item!.isAvailable || !open(item!.availabilitySlots));
     if (unavailable) {
       throw unprocessable('MENU_ITEM_UNAVAILABLE', `« ${unavailable.name} » n'est plus disponible.`);
     }
-    return found.map((item) => {
-      const quantity = quantities.get(item.id) ?? 0;
-      if (quantity > 50) throw unprocessable('QUANTITY_TOO_HIGH', `Quantité trop élevée pour « ${item.name} ».`);
-      return { menuItemId: item.id, name: item.name, unitPriceMinor: item.priceMinor, quantity };
-    });
+
+    // Plats simples : quantités regroupées par plat. Formules : une ligne par composition.
+    const lines = new Map<string, ResolvedLine>();
+    for (const input of items) {
+      const item = byId.get(input.menuItemId)!;
+      let choices: FrozenChoice[] | undefined;
+      if (item.isBundle) {
+        choices = item.bundleGroups.map((group) => {
+          const picked = (input.choices ?? []).filter((choice) => choice.groupId === group.id);
+          const dish = picked.length === 1 && group.choiceIds.includes(picked[0].menuItemId) ? byId.get(picked[0].menuItemId) : undefined;
+          if (!dish || dish.isBundle) {
+            throw unprocessable('BUNDLE_CHOICE_INVALID', `Choisissez un plat pour « ${group.name} » dans « ${item.name} ».`);
+          }
+          if (!dish.isAvailable || !open(dish.availabilitySlots)) throw unprocessable('MENU_ITEM_UNAVAILABLE', `« ${dish.name} » n'est plus disponible.`);
+          return { group: group.name, menuItemId: dish.id, name: dish.name };
+        });
+        if ((input.choices ?? []).length !== item.bundleGroups.length) {
+          throw unprocessable('BUNDLE_CHOICE_INVALID', `Un choix par rubrique pour « ${item.name} ».`);
+        }
+      } else if (input.choices?.length) {
+        throw unprocessable('BUNDLE_CHOICE_INVALID', `« ${item.name} » n'est pas une formule.`);
+      }
+      const options = this.resolveOptions(item, input.options ?? []);
+      const extra = options.reduce((sum, option) => sum + option.priceMinor, 0);
+      const key = [item.id, choices ? `~${choices.map((choice) => choice.menuItemId).join('.')}` : '', options.length ? `+${options.map((o) => o.optionId).sort().join('.')}` : ''].join('');
+      // Spec 033, R1 et spec 039, R2 : en promotion (dans son créneau), le prix promo est commandé et figé ;
+      // le prix de la carte est gardé pour les ventes (R7). Spec 038, R3 : les suppléments s'ajoutent.
+      const promo = item.promoPriceMinor !== null && item.promoPriceMinor < item.priceMinor && open(item.promoSlots);
+      const line = lines.get(key) ?? {
+        menuItemId: item.id,
+        name: item.name,
+        unitPriceMinor: (promo ? item.promoPriceMinor! : item.priceMinor) + extra,
+        listPriceMinor: promo ? item.priceMinor + extra : null,
+        quantity: 0,
+        choices,
+        options: options.length ? options : undefined,
+      };
+      line.quantity += input.quantity;
+      if (line.quantity > 50) throw unprocessable('QUANTITY_TOO_HIGH', `Quantité trop élevée pour « ${item.name} ».`);
+      lines.set(key, line);
+    }
+    return [...lines.values()];
+  }
+
+  /**
+   * Spec 038, R2, R6 et R7 : options d'un plat — les identifiants viennent du client, noms et suppléments de la carte.
+   * Un seul choix dans un groupe à choix unique, au moins un dans un groupe obligatoire, rien hors du plat, rien d'indisponible.
+   */
+  private resolveOptions(
+    item: { name: string; optionGroups: { id: string; name: string; multiple: boolean; required: boolean; options: { id: string; name: string; priceMinor: number; isAvailable: boolean }[] }[] },
+    optionIds: string[],
+  ): FrozenOption[] {
+    const wanted = new Set(optionIds);
+    const invalid = (message: string) => unprocessable('OPTION_CHOICE_INVALID', message);
+    const known = new Set(item.optionGroups.flatMap((group) => group.options.map((option) => option.id)));
+    if ([...wanted].some((id) => !known.has(id))) throw invalid(`Une option ne correspond pas à « ${item.name} ».`);
+    const frozen: FrozenOption[] = [];
+    for (const group of item.optionGroups) {
+      const picked = group.options.filter((option) => wanted.has(option.id));
+      if (group.required && picked.length === 0) throw invalid(`Choisissez « ${group.name} » pour « ${item.name} ».`);
+      if (!group.multiple && picked.length > 1) throw invalid(`Un seul choix pour « ${group.name} ».`);
+      const off = picked.find((option) => !option.isAvailable);
+      if (off) throw invalid(`« ${off.name} » n'est plus disponible.`);
+      frozen.push(...picked.map((option) => ({ group: group.name, optionId: option.id, name: option.name, priceMinor: option.priceMinor })));
+    }
+    return frozen;
   }
 
   /** Le destinataire doit être un membre actif de CET établissement, habilité à traiter. */
@@ -1009,6 +1250,8 @@ export class ServiceRequestsService {
 
   private assertOwnerOrSupervisor(scope: Scope, request: ServiceRequest): void {
     if (request.assigneeId === scope.userId || can(scope, 'requests.assign')) return;
+    // Spec 030, R7 et R9 : une commande partie en préparation sans personne affectée est à toute l'équipe.
+    if (request.assigneeId === null && (request.status === 'in_progress' || request.status === 'ready')) return;
     throw forbidden('NOT_YOUR_REQUEST', 'Cette demande est affectée à un autre membre.');
   }
 

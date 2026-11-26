@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, ParseUUIDPipe, Patch, Post } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiProperty, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, IsArray, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { CurrentScope, RequirePermissions } from '../../commons/decorators';
 import type { Scope } from '../../commons/types';
 import { FloorService } from './floor.service';
@@ -45,6 +45,12 @@ export class UpdateTableDto {
 
 @ApiTags('Salle : zones, tables, QR codes, sessions')
 @ApiBearerAuth()
+/** Spec 042, R5. */
+export class PrintedQrDto {
+  @ApiProperty({ type: [String] }) @IsArray() @ArrayMinSize(1) @ArrayMaxSize(500) @IsUUID('all', { each: true })
+  tableIds: string[];
+}
+
 @Controller({ path: 'establishments/:establishmentId', version: '1' })
 export class FloorController {
   constructor(private readonly floor: FloorService) {}
@@ -113,6 +119,14 @@ export class FloorController {
   @ApiOperation({ summary: 'QR codes actifs (URL, SVG, PNG) pour impression' })
   qrCodes(@CurrentScope() scope: Scope) {
     return this.floor.qrCodes(scope);
+  }
+
+  @Post('qr-codes/printed')
+  @HttpCode(200)
+  @RequirePermissions('qr.manage')
+  @ApiOperation({ summary: 'Spec 042, R5 : marquer imprimés les QR des tables données' })
+  markPrinted(@CurrentScope() scope: Scope, @Body() dto: PrintedQrDto) {
+    return this.floor.markPrinted(scope, dto.tableIds);
   }
 
   @Post('tables/:id/qr/regenerate')

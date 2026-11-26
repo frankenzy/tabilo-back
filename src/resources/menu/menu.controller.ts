@@ -1,11 +1,13 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, ParseUUIDPipe, Patch, Post, Put } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiProperty, ApiPropertyOptional, ApiTags, PartialType } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
+import { Type } from 'class-transformer';
 import {
-  ArrayMaxSize, IsArray, IsBase64, IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength,
+  ArrayMaxSize, ArrayMinSize, IsArray, IsBase64, Matches, ValidateIf, ValidateNested, IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength,
 } from 'class-validator';
 import { CurrentScope, RequirePermissions } from '../../commons/decorators';
 import type { Scope } from '../../commons/types';
+import { SLOT_TIME } from '../../commons/utils/slots';
 import { CATEGORY_ICONS } from './category-icons';
 import { MenuService } from './menu.service';
 
@@ -50,6 +52,84 @@ export class CreateMenuItemDto {
 
   @ApiPropertyOptional({ description: 'false = en rupture' }) @IsOptional() @IsBoolean()
   isAvailable?: boolean;
+
+  @ApiPropertyOptional({ nullable: true, description: 'Spec 033 : prix promotionnel (inférieur au prix) ; null retire la promotion' })
+  @IsOptional() @ValidateIf((_, value) => value !== null) @IsInt() @Min(0) @Max(100_000_000)
+  promoPriceMinor?: number | null;
+
+  @ApiPropertyOptional({ type: () => [SlotDto], nullable: true, description: 'Spec 039 : créneaux de la promotion (1 à 3) ; null = permanente' })
+  @IsOptional() @ValidateIf((_, value) => value !== null) @IsArray() @ArrayMaxSize(3) @ValidateNested({ each: true }) @Type(() => SlotDto)
+  promoSlots?: SlotDto[] | null;
+
+  @ApiPropertyOptional({ nullable: true, description: 'Spec 039 : nom de la promotion (« Happy hour » par défaut)' })
+  @IsOptional() @ValidateIf((_, value) => value !== null) @Transform(trim) @IsString() @MaxLength(30)
+  promoName?: string | null;
+
+  @ApiPropertyOptional({ type: () => [SlotDto], nullable: true, description: 'Spec 039 : créneaux de disponibilité (1 à 3) ; null = toujours' })
+  @IsOptional() @ValidateIf((_, value) => value !== null) @IsArray() @ArrayMaxSize(3) @ValidateNested({ each: true }) @Type(() => SlotDto)
+  availabilitySlots?: SlotDto[] | null;
+
+  @ApiPropertyOptional({ type: () => [OptionGroupDto], description: 'Spec 038 : groupes d’options (0 à 4) ; remplace les groupes existants' })
+  @IsOptional() @IsArray() @ArrayMaxSize(4) @ValidateNested({ each: true }) @Type(() => OptionGroupDto)
+  optionGroups?: OptionGroupDto[];
+
+  @ApiPropertyOptional({ type: () => [BundleGroupDto], description: 'Spec 032 : rubriques d’une formule (1 à 4) ; absent pour un plat' })
+  @IsOptional() @IsArray() @ArrayMinSize(1) @ArrayMaxSize(4) @ValidateNested({ each: true }) @Type(() => BundleGroupDto)
+  groups?: BundleGroupDto[];
+}
+
+/** Spec 039, R1 : un créneau (jours ISO 1 à 7, heures au quart d'heure). */
+export class SlotDto {
+  @ApiProperty({ type: [Number], example: [1, 2, 3, 4, 5] }) @IsArray() @ArrayMinSize(1) @ArrayMaxSize(7) @IsInt({ each: true }) @Min(1, { each: true }) @Max(7, { each: true })
+  days: number[];
+
+  @ApiProperty({ example: '17:00' }) @Matches(SLOT_TIME)
+  start: string;
+
+  @ApiProperty({ example: '19:00' }) @Matches(SLOT_TIME)
+  end: string;
+}
+
+/** Spec 038, R1 : une option et son supplément. */
+export class OptionDto {
+  @ApiPropertyOptional() @IsOptional() @IsUUID()
+  id?: string;
+
+  @ApiProperty() @Transform(trim) @IsString() @MinLength(1) @MaxLength(40)
+  name: string;
+
+  @ApiProperty({ description: 'Supplément en unité mineure (0 = sans supplément)' }) @IsInt() @Min(0) @Max(100_000_000)
+  priceMinor: number;
+
+  @ApiPropertyOptional({ enum: CATEGORY_ICONS, nullable: true }) @IsOptional() @ValidateIf((_, value) => value !== null) @IsIn([...CATEGORY_ICONS])
+  icon?: string | null;
+
+  @ApiPropertyOptional() @IsOptional() @IsBoolean()
+  isAvailable?: boolean;
+}
+
+/** Spec 038, R1 : un groupe d'options (2 à 10). */
+export class OptionGroupDto {
+  @ApiProperty({ example: 'Taille' }) @Transform(trim) @IsString() @MinLength(1) @MaxLength(40)
+  name: string;
+
+  @ApiProperty() @IsBoolean()
+  multiple: boolean;
+
+  @ApiProperty() @IsBoolean()
+  required: boolean;
+
+  @ApiProperty({ type: [OptionDto] }) @IsArray() @ArrayMinSize(2) @ArrayMaxSize(10) @ValidateNested({ each: true }) @Type(() => OptionDto)
+  options: OptionDto[];
+}
+
+/** Spec 032, R1 : une rubrique de formule et ses plats (1 à 12). */
+export class BundleGroupDto {
+  @ApiProperty({ example: 'Boisson' }) @Transform(trim) @IsString() @MinLength(1) @MaxLength(40)
+  name: string;
+
+  @ApiProperty({ type: [String] }) @IsArray() @ArrayMinSize(1) @ArrayMaxSize(12) @IsUUID('all', { each: true })
+  choiceIds: string[];
 }
 
 export class UpdateMenuItemDto extends PartialType(CreateMenuItemDto) {}

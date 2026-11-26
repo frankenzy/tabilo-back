@@ -33,7 +33,11 @@ describe('Demandes : parcours client, cycle de vie, concurrence, escalade', () =
 
     it('ouvre une session sans exposer de donnée interne, jeton haché en base', async () => {
       const res = await t.http.post('/api/v1/guest/sessions').send({ code: floor.code }).expect(201);
-      expect(res.body.establishment).toEqual({ name: 'La Terrasse', currency: 'XOF' });
+      // Specs 031, 039 et 043 : apparence, fuseau et clé de fidélité sont publics ; aucun identifiant interne.
+      expect(res.body.establishment).toEqual({
+        name: 'La Terrasse', currency: 'XOF', logoImageId: null, brandColor: 'orange', welcomeText: null, timezone: 'Africa/Abidjan',
+        key: expect.stringMatching(/^[0-9a-f]{16}$/),
+      });
       expect(res.body.requestTypes.length).toBeGreaterThan(0);
       expect(JSON.stringify(res.body)).not.toContain(owner.establishmentId);
       const stored = await t.prisma.tableSession.findMany({ where: { tableId: floor.tableId } });
@@ -42,7 +46,8 @@ describe('Demandes : parcours client, cycle de vie, concurrence, escalade', () =
 
     it('rend la création idempotente et dédoublonne une demande déjà active', async () => {
       const guest = await openSession(t, floor.code);
-      const body = { requestTypeId: guest.typeIds[0], note: '  Sans glaçons  ' };
+      // Spec 029 : typeIds[0] est l'appel (sans texte) ; « De l'eau » est une demande de service qui accepte une précision.
+      const body = { requestTypeId: guest.typeIds[1], note: '  Sans glaçons  ' };
       const key = { 'idempotency-key': 'abcdef123456' };
       const [first, second] = await Promise.all([
         t.http.post('/api/v1/guest/requests').set(guest.headers).set(key).send(body),
@@ -54,7 +59,7 @@ describe('Demandes : parcours client, cycle de vie, concurrence, escalade', () =
       expect([first.body.deduplicated, second.body.deduplicated].sort()).toEqual([false, true]);
       // Autre téléphone, même table, même type : la demande existante est renvoyée.
       const other = await openSession(t, floor.code);
-      const dup = await t.http.post('/api/v1/guest/requests').set(other.headers).send({ requestTypeId: other.typeIds[0] }).expect(200);
+      const dup = await t.http.post('/api/v1/guest/requests').set(other.headers).send({ requestTypeId: other.typeIds[1] }).expect(200);
       expect(dup.body.request.id).toBe(first.body.request.id);
       expect(dup.body.deduplicated).toBe(true);
       const count = await t.prisma.serviceRequest.count({ where: { tableId: floor.tableId } });
@@ -81,10 +86,22 @@ describe('Demandes : parcours client, cycle de vie, concurrence, escalade', () =
     });
 
     it('limite les ouvertures de session par table (QR photographié)', async () => {
+      // Spec 027, R2 : 16 téléphones connectés au plus par table (un repère chacun).
+      const crowded = await createTable(t, owner);
+      for (let i = 0; i < 16; i += 1) await openSession(t, crowded.code);
+      const full = await t.http.post('/api/v1/guest/sessions').send({ code: crowded.code });
+      expect(full.status).toBe(429);
+      expect(full.body.code).toBe('TOO_MANY_SESSIONS');
+
+      // Plafond de fréquence : 20 ouvertures en 10 minutes, même si les sessions se ferment entre-temps.
       const table = await createTable(t, owner);
-      for (let i = 0; i < 20; i += 1) await openSession(t, table.code);
+      for (let i = 0; i < 20; i += 1) {
+        await openSession(t, table.code);
+        await t.prisma.tableSession.updateMany({ where: { tableId: table.tableId, status: 'open' }, data: { status: 'closed', closedAt: new Date() } });
+      }
       const res = await t.http.post('/api/v1/guest/sessions').send({ code: table.code });
       expect(res.status).toBe(429);
+      expect(res.body.message).toContain('Réessayez');
     });
 
     it('bloque toute demande après fermeture, expiration ou révocation', async () => {
@@ -279,7 +296,9 @@ describe('Demandes : parcours client, cycle de vie, concurrence, escalade', () =
     it('calcule des indicateurs exacts à partir des horodatages (médiane ≠ moyenne)', async () => {
       const tenant = await registerTenant(t, 'Mesures');
       const floor = await createTable(t, tenant);
-      const types = await t.http.get(`${tenant.base}/request-types`).set(tenant.auth).expect(200);
+      const all = await t.http.get(`${tenant.base}/request-types`).set(tenant.auth).expect(200);
+      // Specs 028 et 029 : le personnel ne saisit que des demandes de service ou des appels (ni addition, ni message, ni commande).
+      const types = { body: (all.body as { id: string; kind: string }[]).filter((type) => type.kind === 'service' || type.kind === 'call') };
       const base = Date.now() - 3_600_000;
       // Prises en charge en 60 s, 120 s et 600 s : médiane 120 s, moyenne 260 s.
       const accepts = [60, 120, 600];
@@ -297,7 +316,7 @@ describe('Demandes : parcours client, cycle de vie, concurrence, escalade', () =
         });
       }
       const cancelled = await t.http.post(`${tenant.base}/requests`).set(tenant.auth)
-        .send({ tableId: floor.tableId, requestTypeId: types.body[3].id }).expect(201);
+        .send({ tableId: floor.tableId, requestTypeId: types.body[2].id }).expect(201);
       await t.http.post(`${tenant.base}/requests/${cancelled.body.id}/cancel`).set(tenant.auth).send({}).expect(200);
 
       const report = await t.http.get(`${tenant.base}/analytics/report`)

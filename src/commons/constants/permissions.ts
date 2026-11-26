@@ -16,6 +16,8 @@ export const PERMISSIONS = {
   'requests.assign': 'Affecter, réaffecter et transférer toute demande',
   'requests.cancel': 'Annuler une demande',
   'requests.supervise': 'Recevoir et acquitter les escalades',
+  /** Spec 033, R6 : propriétaire et gérant par défaut ; un serveur la reçoit par son rôle (spec 010). */
+  'orders.offer': 'Offrir une ligne de commande',
   'staff.read': "Consulter l'équipe",
   'staff.manage': "Gérer les membres de l'équipe",
   'roles.manage': 'Créer et modifier les rôles personnalisés',

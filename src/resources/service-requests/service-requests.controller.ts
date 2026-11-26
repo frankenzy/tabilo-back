@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentScope, RequirePermissions } from '../../commons/decorators';
 import type { Scope } from '../../commons/types';
@@ -131,6 +131,21 @@ export class ServiceRequestsController {
   @ApiOperation({ summary: 'Affecter ou réaffecter une demande (supervision)' })
   assign(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string, @Body() dto: AssignRequestDto) {
     return this.requests.assign(scope, id, dto);
+  }
+
+  @Post(':id/items/:itemId/offer')
+  @HttpCode(200)
+  @RequirePermissions('orders.offer')
+  @ApiOperation({ summary: 'Spec 033 : offrir une ligne entière d’une commande non réglée' })
+  offer(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string, @Param('itemId', ParseUUIDPipe) itemId: string) {
+    return this.requests.offerLine(scope, id, itemId, true);
+  }
+
+  @Delete(':id/items/:itemId/offer')
+  @RequirePermissions('orders.offer')
+  @ApiOperation({ summary: 'Spec 033 : retirer le cadeau d’une ligne, tant que la commande n’est pas réglée' })
+  unoffer(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string, @Param('itemId', ParseUUIDPipe) itemId: string) {
+    return this.requests.offerLine(scope, id, itemId, false);
   }
 
   @Post(':id/cancel')

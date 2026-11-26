@@ -18,6 +18,8 @@ export type DomainEventType =
   | 'request.paid'
   /** Spec 027, R9 : commande marquée « Parti sans payer ». */
   | 'request.written_off'
+  /** Spec 033, R4 et R5 : une ligne offerte, ou son cadeau retiré. */
+  | 'request.offered'
   | 'session.closed'
   /** Spec 027, R4 : toutes les commandes de la session sont servies et réglées. */
   | 'session.settled'

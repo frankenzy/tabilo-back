@@ -1,8 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../commons/prisma/prisma.service';
+import { PlanService } from '../../commons/services/plan.service';
 import type { Scope } from '../../commons/types';
 import { unprocessable } from '../../commons/utils/errors';
+import { PAYABLE_SQL } from '../service-requests/bill';
 
 export interface ReportFilters {
   from: Date;
@@ -72,6 +74,9 @@ export interface SalesFigures {
   writtenOffMinor: number;
   /** Nombre de clients (sessions) concernés. */
   writtenOffCustomers: number;
+  /** Spec 033, R7 : lignes offertes et remises de promotion des commandes vendues sur la période (hors total). */
+  offeredMinor: number;
+  discountMinor: number;
 }
 
 /** Spec 027, R13 : un client parti sans payer, pour la liste de la carte « Impayés ». */
@@ -174,7 +179,10 @@ const MAX_RANGE_DAYS = 366;
  */
 @Injectable()
 export class AnalyticsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly plans: PlanService,
+  ) {}
 
   /** Situation de la salle à l'instant. */
   async live(scope: Scope) {
@@ -241,7 +249,9 @@ export class AnalyticsService {
       ${filters.assigneeId ? Prisma.sql`AND r."assigneeId" = ${filters.assigneeId}::uuid` : Prisma.empty}`;
 
     // Somme en float8 : exacte jusqu'à 2^53, sans le BigInt que renverrait un bigint.
-    const served = Prisma.sql`coalesce(sum(r."totalMinor") FILTER (WHERE r.status = 'resolved'), 0)::float8`;
+    // Spec 030, Q2 : une commande compte dès qu'elle est servie ou réglée.
+    const sold = Prisma.sql`(r.status = 'resolved' OR (r."paidAt" IS NOT NULL AND r.status <> 'cancelled'))`;
+    const served = Prisma.sql`coalesce(sum(r."totalMinor") FILTER (WHERE ${sold}), 0)::float8`;
     const late = Prisma.sql`(r."acceptedAt" > r."dueAt" OR (r."acceptedAt" IS NULL AND r.status IN ('pending', 'assigned') AND r."dueAt" < now()))`;
     const median = (column: string) => Prisma.sql`
       percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM r.${Prisma.raw(`"${column}"`)} - r."createdAt"))
@@ -302,7 +312,7 @@ export class AnalyticsService {
         GROUP BY 1 ORDER BY 1`,
       this.prisma.$queryRaw<{ currency: string; orders: number; amountMinor: number }[]>`
         SELECT est.currency,
-          count(r.id) FILTER (WHERE r.status = 'resolved' AND r."totalMinor" IS NOT NULL)::int AS orders,
+          count(r.id) FILTER (WHERE ${sold} AND r."totalMinor" IS NOT NULL)::int AS orders,
           ${served} AS "amountMinor"
         FROM "Establishment" est
         LEFT JOIN "ServiceRequest" r ON r."establishmentId" = est.id AND ${where}
@@ -315,7 +325,7 @@ export class AnalyticsService {
           sum(i.quantity)::int AS quantity,
           sum(i.quantity * i."unitPriceMinor")::float8 AS "amountMinor"
         FROM "ServiceRequestItem" i JOIN "ServiceRequest" r ON r.id = i."requestId"
-        WHERE ${where} AND r.status = 'resolved'
+        WHERE ${where} AND ${sold}
         GROUP BY i."menuItemId"
         ORDER BY "amountMinor" DESC, name ASC LIMIT 10`,
     ]);
@@ -503,6 +513,8 @@ export class AnalyticsService {
    * Passage à table : commandes servies d'une même table, un écart de plus de 2 h ouvre un nouveau passage.
    */
   async sales(scope: Scope, period: SalesPeriod): Promise<SalesOverview> {
+    // Spec 034, R4 : les ventes de l'année sont réservées aux formules qui les comprennent.
+    if (period === 'year') await this.plans.assertFeature(scope.tenantId, 'yearly_stats');
     const unit = period === 'month' ? '1 month' : '1 year';
     const trunc = Prisma.raw(`'${period}'`);
     const [row] = await this.prisma.$queryRaw<
@@ -511,7 +523,7 @@ export class AnalyticsService {
         from: string;
         totals: {
           shift: number; totalMinor: number; orders: number; passages: number; paidMinor: number; paidOrders: number;
-          writtenOffMinor: number; writtenOffCustomers: number;
+          writtenOffMinor: number; writtenOffCustomers: number; offeredMinor: number; discountMinor: number;
         }[];
         outstanding: { amountMinor: number; orders: number; tables: number };
       }[]
@@ -533,8 +545,9 @@ export class AnalyticsService {
           CASE WHEN r."createdAt" - lag(r."createdAt") OVER (PARTITION BY g.shift, r."tableId" ORDER BY r."createdAt") <= interval '2 hours'
             THEN 0 ELSE 1 END AS opens
         FROM "ServiceRequest" r
-        JOIN ranges g ON r."resolvedAt" >= g.start AND r."resolvedAt" < g.stop
-        WHERE ${this.scopeSql(scope)} AND r.status = 'resolved' AND r."totalMinor" IS NOT NULL
+        -- Spec 030, Q2 : servie ou réglée, datée de la première des deux.
+        JOIN ranges g ON least(r."resolvedAt", r."paidAt") >= g.start AND least(r."resolvedAt", r."paidAt") < g.stop
+        WHERE ${this.scopeSql(scope)} AND (r.status = 'resolved' OR (r."paidAt" IS NOT NULL AND r.status <> 'cancelled')) AND r."totalMinor" IS NOT NULL
       )
       SELECT est.currency,
         to_char(date_trunc(${trunc}, est.local_now), 'YYYY-MM-DD') AS "from",
@@ -551,7 +564,18 @@ export class AnalyticsService {
             (SELECT coalesce(sum(r."totalMinor"), 0)::bigint::float8 FROM "ServiceRequest" r
               WHERE ${this.scopeSql(scope)} AND r."totalMinor" IS NOT NULL AND r."writtenOffAt" >= g.start AND r."writtenOffAt" < g.stop) AS "writtenOffMinor",
             (SELECT count(DISTINCT coalesce(r."sessionId", r.id))::int FROM "ServiceRequest" r
-              WHERE ${this.scopeSql(scope)} AND r."totalMinor" IS NOT NULL AND r."writtenOffAt" >= g.start AND r."writtenOffAt" < g.stop) AS "writtenOffCustomers"
+              WHERE ${this.scopeSql(scope)} AND r."totalMinor" IS NOT NULL AND r."writtenOffAt" >= g.start AND r."writtenOffAt" < g.stop) AS "writtenOffCustomers",
+            -- Spec 033, R7 : offert et remises de promotion des commandes vendues sur la période, à part du total.
+            (SELECT coalesce(sum(i."unitPriceMinor" * i.quantity), 0)::bigint::float8
+              FROM "ServiceRequestItem" i JOIN "ServiceRequest" r ON r.id = i."requestId"
+              WHERE ${this.scopeSql(scope)} AND EXISTS (SELECT 1 FROM "ServiceRequestItemOffer" f WHERE f."itemId" = i.id)
+                AND (r.status = 'resolved' OR (r."paidAt" IS NOT NULL AND r.status <> 'cancelled'))
+                AND least(r."resolvedAt", r."paidAt") >= g.start AND least(r."resolvedAt", r."paidAt") < g.stop) AS "offeredMinor",
+            (SELECT coalesce(sum((i."listPriceMinor" - i."unitPriceMinor") * i.quantity), 0)::bigint::float8
+              FROM "ServiceRequestItem" i JOIN "ServiceRequest" r ON r.id = i."requestId"
+              WHERE ${this.scopeSql(scope)} AND i."listPriceMinor" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "ServiceRequestItemOffer" f WHERE f."itemId" = i.id)
+                AND (r.status = 'resolved' OR (r."paidAt" IS NOT NULL AND r.status <> 'cancelled'))
+                AND least(r."resolvedAt", r."paidAt") >= g.start AND least(r."resolvedAt", r."paidAt") < g.stop) AS "discountMinor"
           FROM ranges g LEFT JOIN served sv ON sv.shift = g.shift
           GROUP BY g.shift, g.start, g.stop
         ) t) AS totals,
@@ -561,13 +585,13 @@ export class AnalyticsService {
             'orders', count(*)::int,
             'tables', count(DISTINCT r."tableId")::int)
           FROM "ServiceRequest" r
-          WHERE ${this.scopeSql(scope)} AND r.status = 'resolved' AND r."totalMinor" IS NOT NULL AND r."paidAt" IS NULL
-            AND r."writtenOffAt" IS NULL) AS outstanding
+          -- Spec 030 : même règle que le règlement.
+          WHERE ${this.scopeSql(scope)} AND ${PAYABLE_SQL}) AS outstanding
       FROM est`;
     if (!row) throw unprocessable('ESTABLISHMENT_NOT_FOUND', 'Établissement introuvable.');
     const figures = (shift: number): SalesFigures => {
       const t = row.totals.find((x) => x.shift === shift) ?? {
-        totalMinor: 0, orders: 0, passages: 0, paidMinor: 0, paidOrders: 0, writtenOffMinor: 0, writtenOffCustomers: 0,
+        totalMinor: 0, orders: 0, passages: 0, paidMinor: 0, paidOrders: 0, writtenOffMinor: 0, writtenOffCustomers: 0, offeredMinor: 0, discountMinor: 0,
       };
       return {
         totalMinor: Math.round(t.totalMinor),
@@ -578,6 +602,8 @@ export class AnalyticsService {
         paidOrders: t.paidOrders,
         writtenOffMinor: Math.round(t.writtenOffMinor),
         writtenOffCustomers: t.writtenOffCustomers,
+        offeredMinor: Math.round(t.offeredMinor),
+        discountMinor: Math.round(t.discountMinor),
       };
     };
     const outstanding = { amountMinor: Math.round(row.outstanding.amountMinor), orders: row.outstanding.orders, tables: row.outstanding.tables };
