@@ -8,6 +8,8 @@ import * as argon2 from 'argon2';
 import { Transform } from 'class-transformer';
 import { IsEmail, IsEnum, IsIn, IsInt, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
 import type { FastifyReply, FastifyRequest } from 'fastify';
+// Types de `request.cookies` et `reply.setCookie` (plugin enregistré dans app.setup.ts).
+import type {} from '@fastify/cookie';
 import { APP_ENV, AppEnv } from '../../commons/config/env';
 import { ERASE_DELAY_DEFAULT_DAYS, ERASE_DELAY_MAX_DAYS } from '../../commons/constants/legal';
 import { PLANS } from '../../commons/constants/plans';
@@ -26,7 +28,6 @@ const SESSION_HOURS = 8;
 const MAX_FAILED = 5;
 const LOCK_MINUTES = 15;
 const RESET_HOURS = 24;
-export const PLATFORM_PASSWORD_MIN = 14;
 
 const trim = ({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value);
 
@@ -545,17 +546,11 @@ export class PlatformController {
   }
 }
 
-/** Création du premier compte plateforme (R1) : utilisée par la commande `pnpm platform:create-admin`. */
-export async function createPlatformAdmin(prisma: PrismaService | Tx, email: string, name: string, password: string): Promise<string> {
-  if (password.length < PLATFORM_PASSWORD_MIN) throw unprocessable('PASSWORD_TOO_SHORT', `Au moins ${PLATFORM_PASSWORD_MIN} caractères.`);
-  const passwordHash = await argon2.hash(password, { type: argon2.argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 });
-  const admin = await prisma.platformAdmin.create({ data: { email: email.trim().toLowerCase(), name, passwordHash } });
-  return admin.id;
-}
-
 @Module({
   imports: [SubscriptionModule],
   controllers: [PlatformAuthController, PlatformController],
   providers: [PlatformService, PlatformGuard],
 })
 export class PlatformModule {}
+
+export { createPlatformAdmin, PLATFORM_PASSWORD_MIN } from './platform-admin';
