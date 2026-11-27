@@ -24,7 +24,9 @@ export type DomainEventType =
   /** Spec 027, R4 : toutes les commandes de la session sont servies et réglées. */
   | 'session.settled'
   /** Spec 027, R9 : alerte de départ sans payer créée ou traitée. */
-  | 'alert.changed';
+  | 'alert.changed'
+  /** Spec 047, R6 : un client réglé a libéré la table. */
+  | 'session.left';
 
 export interface DomainEventPayload {
   requestId?: string;
@@ -34,6 +36,9 @@ export interface DomainEventPayload {
   previousAssigneeId?: string | null;
   ruleName?: string;
   alertId?: string;
+  /** Spec 047, R6 : nom de la table et table libre après le départ. */
+  tableLabel?: string;
+  tableFree?: boolean;
 }
 
 export interface DomainEvent extends DomainEventPayload {
