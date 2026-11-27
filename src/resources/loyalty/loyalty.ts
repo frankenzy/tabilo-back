@@ -1,7 +1,7 @@
-import { Body, Controller, Get, HttpCode, Injectable, Module, Param, ParseUUIDPipe, Post, Put, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Injectable, Module, Param, ParseUUIDPipe, Patch, Post, Put, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiHeader, ApiOperation, ApiProperty, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
-import { IsBoolean, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength } from 'class-validator';
-import { CurrentGuest, CurrentScope, Public, RequirePermissions } from '../../commons/decorators';
+import { IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength, ValidateIf } from 'class-validator';
+import { AllowSettledSession, CurrentGuest, CurrentScope, Public, RequirePermissions } from '../../commons/decorators';
 import { GuestSessionGuard, SESSION_HEADER } from '../../commons/guards/guest-session.guard';
 import { PrismaService } from '../../commons/prisma/prisma.service';
 import { AuditService } from '../../commons/services/audit.service';
@@ -13,17 +13,33 @@ import { OutboxService } from '../outbox/outbox.service';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { ServiceRequestsModule } from '../service-requests/service-requests.module';
 import { ServiceRequestsService, staffActor } from '../service-requests/service-requests.service';
+import { MenuImageDto } from '../menu/menu.controller';
+import { CreatePrizeDto, SurpriseService, UpdatePrizeDto, type SurpriseCardView } from './loyalty-surprise';
 
-/** Spec 043, R1 : la carte de fidélité de l'établissement. */
+/** Spec 043, R1 et spec 046, R1 : la carte de fidélité de l'établissement, en mode Classique ou Surprise. */
 export class LoyaltyProgramDto {
-  @ApiProperty({ minimum: 5, maximum: 20 }) @IsInt() @Min(5) @Max(20)
-  stampsRequired: number;
+  @ApiPropertyOptional({ enum: ['classic', 'surprise'], default: 'classic' }) @IsOptional() @IsIn(['classic', 'surprise'])
+  mode?: 'classic' | 'surprise';
+
+  @ApiPropertyOptional({ minimum: 5, maximum: 20, description: 'Mode Classique' }) @ValidateIf((dto: LoyaltyProgramDto) => dto.mode !== 'surprise' || dto.stampsRequired !== undefined)
+  @IsInt() @Min(5) @Max(20)
+  stampsRequired?: number;
 
   @ApiProperty({ description: 'Montant minimum d’une commande réglée pour un tampon (unité mineure)' }) @IsInt() @Min(0) @Max(100_000_000)
   minOrderMinor: number;
 
-  @ApiProperty() @IsUUID()
-  rewardItemId: string;
+  @ApiPropertyOptional({ description: 'Récompense du mode Classique' }) @ValidateIf((dto: LoyaltyProgramDto) => dto.mode !== 'surprise' || dto.rewardItemId !== undefined)
+  @IsUUID()
+  rewardItemId?: string;
+
+  @ApiPropertyOptional({ minimum: 1, maximum: 20, description: 'Mode Surprise : au moins tant de commandes' }) @IsOptional() @IsInt() @Min(1) @Max(20)
+  surpriseMin?: number;
+
+  @ApiPropertyOptional({ minimum: 1, maximum: 20, description: 'Mode Surprise : au plus tant de commandes' }) @IsOptional() @IsInt() @Min(1) @Max(20)
+  surpriseMax?: number;
+
+  @ApiPropertyOptional({ minimum: 1, maximum: 365, description: 'Validité d’un cadeau, en jours' }) @IsOptional() @IsInt() @Min(1) @Max(365)
+  giftValidityDays?: number;
 
   @ApiPropertyOptional() @IsOptional() @IsBoolean()
   isActive?: boolean;
@@ -38,10 +54,13 @@ export class AttachCardDto {
 export interface GuestCardView {
   /** Jeton à garder dans le téléphone ; renvoyé seulement à la création de la carte. */
   token?: string;
+  mode: 'classic' | 'surprise';
   stamps: number;
   stampsRequired: number;
   minOrderMinor: number;
-  rewardItemId: string;
+  rewardItemId: string | null;
+  /** Spec 046 : cadeaux du mode Surprise (le prochain seuil n'est jamais envoyé). */
+  surprise: SurpriseCardView | null;
   /** Récompense demandée pendant cette visite, en attente ou validée. */
   redemption: { id: string; validated: boolean } | null;
 }
@@ -54,6 +73,7 @@ export class LoyaltyService {
     private readonly plans: PlanService,
     private readonly outbox: OutboxService,
     private readonly requests: ServiceRequestsService,
+    private readonly surprise: SurpriseService,
   ) {}
 
   // ---------------------------------------------------------------- gérant
@@ -65,16 +85,45 @@ export class LoyaltyService {
   /** R1 et R7 : réglage de la carte, réservé aux formules qui comprennent la fidélité. */
   async saveProgram(scope: Scope, dto: LoyaltyProgramDto) {
     await this.plans.assertFeature(scope.tenantId, 'loyalty');
-    const reward = await this.prisma.menuItem.findFirst({
-      where: { id: dto.rewardItemId, tenantId: scope.tenantId, establishmentId: scope.establishmentId, archivedAt: null },
-      select: { id: true },
-    });
-    if (!reward) throw unprocessable('REWARD_NOT_FOUND', 'Choisissez une récompense parmi les plats de la carte.');
-    const data = { stampsRequired: dto.stampsRequired, minOrderMinor: dto.minOrderMinor, rewardItemId: dto.rewardItemId, isActive: dto.isActive ?? true };
-    const saved = await this.prisma.loyaltyProgram.upsert({
-      where: { establishmentId: scope.establishmentId },
-      create: { tenantId: scope.tenantId, establishmentId: scope.establishmentId, ...data },
-      update: data,
+    const mode = dto.mode ?? 'classic';
+    const current = await this.prisma.loyaltyProgram.findUnique({ where: { establishmentId: scope.establishmentId } });
+    if (dto.rewardItemId !== undefined) {
+      const reward = await this.prisma.menuItem.findFirst({
+        where: { id: dto.rewardItemId, tenantId: scope.tenantId, establishmentId: scope.establishmentId, archivedAt: null },
+        select: { id: true },
+      });
+      if (!reward) throw unprocessable('REWARD_NOT_FOUND', 'Choisissez une récompense parmi les plats de la carte.');
+    }
+    const surpriseMin = dto.surpriseMin ?? current?.surpriseMin ?? 2;
+    const surpriseMax = dto.surpriseMax ?? current?.surpriseMax ?? 5;
+    const isActive = dto.isActive ?? true;
+    if (mode === 'surprise') {
+      // Spec 046, R4 et R3 : un intervalle cohérent et un panier qui donne toujours quelque chose.
+      if (surpriseMin > surpriseMax) throw unprocessable('INVALID_RANGE', 'Le minimum de commandes doit être inférieur ou égal au maximum.');
+      if (isActive) await this.surprise.assertValidBasket(scope.establishmentId);
+    }
+    const data = {
+      mode,
+      stampsRequired: dto.stampsRequired ?? current?.stampsRequired ?? 10,
+      minOrderMinor: dto.minOrderMinor,
+      rewardItemId: dto.rewardItemId ?? current?.rewardItemId ?? null,
+      surpriseMin,
+      surpriseMax,
+      giftValidityDays: dto.giftValidityDays ?? current?.giftValidityDays ?? 30,
+      isActive,
+    };
+    const saved = await this.prisma.$transaction(async (tx) => {
+      const program = await tx.loyaltyProgram.upsert({
+        where: { establishmentId: scope.establishmentId },
+        create: { tenantId: scope.tenantId, establishmentId: scope.establishmentId, ...data },
+        update: data,
+      });
+      // Spec 046, R1 et Q10 : en passant en mode Surprise (ou en changeant l'intervalle), le prochain seuil est
+      // retiré à partir des tampons en cours.
+      if (mode === 'surprise' && (current?.mode !== 'surprise' || current.surpriseMin !== surpriseMin || current.surpriseMax !== surpriseMax)) {
+        await tx.loyaltyCard.updateMany({ where: { establishmentId: scope.establishmentId }, data: { nextGiftAt: null } });
+      }
+      return program;
     });
     await this.audit.record({ action: 'loyalty.program_saved', tenantId: scope.tenantId, establishmentId: scope.establishmentId, actorId: scope.userId, metadata: data, ip: scope.ip });
     return saved;
@@ -150,12 +199,14 @@ export class LoyaltyService {
   async redeem(guest: GuestSession): Promise<GuestCardView> {
     const program = await this.activeProgram(guest);
     if (!program) throw unprocessable('LOYALTY_DISABLED', 'Pas de carte de fidélité ici.');
+    if (program.mode !== 'classic' || !program.rewardItemId) throw unprocessable('LOYALTY_MODE', 'Ici, les cadeaux se gagnent en mode Surprise.');
+    const rewardItemId = program.rewardItemId;
     const session = await this.prisma.tableSession.findUniqueOrThrow({ where: { id: guest.id }, select: { loyaltyCardId: true } });
     if (!session.loyaltyCardId) throw unprocessable('NO_CARD', 'Aucune carte sur ce téléphone.');
     const card = await this.prisma.loyaltyCard.findUniqueOrThrow({ where: { id: session.loyaltyCardId } });
     if (card.stamps < program.stampsRequired) throw unprocessable('CARD_NOT_FULL', 'La carte n’est pas encore pleine.');
     const created = await this.prisma.loyaltyRedemption.createMany({
-      data: [{ tenantId: guest.tenantId, establishmentId: guest.establishmentId, cardId: card.id, sessionId: guest.id, tableId: guest.tableId, rewardItemId: program.rewardItemId }],
+      data: [{ tenantId: guest.tenantId, establishmentId: guest.establishmentId, cardId: card.id, sessionId: guest.id, tableId: guest.tableId, rewardItemId }],
       skipDuplicates: true,
     });
     if (created.count === 0) throw conflict('ALREADY_REDEEMED', 'Une récompense est déjà demandée pendant cette visite.');
@@ -168,16 +219,31 @@ export class LoyaltyService {
     return program?.isActive ? program : null;
   }
 
-  private async view(guest: GuestSession, cardId: string, program: { stampsRequired: number; minOrderMinor: number; rewardItemId: string }): Promise<GuestCardView> {
+  /** Spec 046 : carte de la session, pour déballer et utiliser ses cadeaux. */
+  async sessionCard(guest: GuestSession): Promise<string> {
+    const program = await this.activeProgram(guest);
+    if (!program) throw unprocessable('LOYALTY_DISABLED', 'Pas de carte de fidélité ici.');
+    const session = await this.prisma.tableSession.findUniqueOrThrow({ where: { id: guest.id }, select: { loyaltyCardId: true } });
+    if (!session.loyaltyCardId) throw unprocessable('NO_CARD', 'Aucune carte sur ce téléphone.');
+    return session.loyaltyCardId;
+  }
+
+  private async view(
+    guest: GuestSession,
+    cardId: string,
+    program: { mode: 'classic' | 'surprise'; stampsRequired: number; minOrderMinor: number; rewardItemId: string | null },
+  ): Promise<GuestCardView> {
     const [card, redemption] = await Promise.all([
       this.prisma.loyaltyCard.findUniqueOrThrow({ where: { id: cardId }, select: { stamps: true } }),
       this.prisma.loyaltyRedemption.findUnique({ where: { sessionId: guest.id }, select: { id: true, validatedAt: true } }),
     ]);
     return {
+      mode: program.mode,
       stamps: card.stamps,
       stampsRequired: program.stampsRequired,
       minOrderMinor: program.minOrderMinor,
       rewardItemId: program.rewardItemId,
+      surprise: program.mode === 'surprise' ? await this.surprise.cardView(cardId) : null,
       redemption: redemption ? { id: redemption.id, validated: redemption.validatedAt !== null } : null,
     };
   }
@@ -187,7 +253,10 @@ export class LoyaltyService {
 @ApiBearerAuth()
 @Controller({ path: 'establishments/:establishmentId/loyalty', version: '1' })
 export class LoyaltyStaffController {
-  constructor(private readonly loyalty: LoyaltyService) {}
+  constructor(
+    private readonly loyalty: LoyaltyService,
+    private readonly surprise: SurpriseService,
+  ) {}
 
   @Get()
   @RequirePermissions('menu.manage')
@@ -204,9 +273,58 @@ export class LoyaltyStaffController {
 
   @Get('redemptions')
   @RequirePermissions('requests.read')
-  @ApiOperation({ summary: 'Spec 043, R4 : récompenses à valider' })
-  pending(@CurrentScope() scope: Scope) {
-    return this.loyalty.pending(scope);
+  @ApiOperation({ summary: 'Spec 043, R4 et spec 046, R10 : récompenses et cadeaux à valider' })
+  async pending(@CurrentScope() scope: Scope) {
+    const [rewards, gifts] = await Promise.all([this.loyalty.pending(scope), this.surprise.pending(scope)]);
+    return [...rewards.map((row) => ({ ...row, kind: 'reward' as const })), ...gifts].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  @Post('gifts/:id/validate')
+  @HttpCode(200)
+  @RequirePermissions('requests.handle')
+  @ApiOperation({ summary: 'Spec 046, R10 : valider un cadeau (plat offert ou lot remis)' })
+  validateGift(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string) {
+    return this.surprise.validate(scope, id);
+  }
+
+  @Get('prizes')
+  @RequirePermissions('menu.manage')
+  @ApiOperation({ summary: 'Spec 046, R2 : le panier de cadeaux' })
+  prizes(@CurrentScope() scope: Scope) {
+    return this.surprise.prizes(scope);
+  }
+
+  @Post('prizes')
+  @RequirePermissions('menu.manage')
+  @ApiOperation({ summary: 'Spec 046, R2 : ajouter un cadeau au panier' })
+  createPrize(@CurrentScope() scope: Scope, @Body() dto: CreatePrizeDto) {
+    return this.surprise.createPrize(scope, dto);
+  }
+
+  @Patch('prizes/:id')
+  @RequirePermissions('menu.manage')
+  updatePrize(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdatePrizeDto) {
+    return this.surprise.updatePrize(scope, id, dto);
+  }
+
+  @Delete('prizes/:id')
+  @HttpCode(204)
+  @RequirePermissions('menu.manage')
+  @ApiOperation({ summary: 'Spec 046, R2 : retirer un cadeau (archivé)' })
+  async archivePrize(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string): Promise<void> {
+    await this.surprise.archivePrize(scope, id);
+  }
+
+  @Put('prizes/:id/image')
+  @RequirePermissions('menu.manage')
+  setPrizeImage(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string, @Body() dto: MenuImageDto) {
+    return this.surprise.setPrizeImage(scope, id, dto);
+  }
+
+  @Delete('prizes/:id/image')
+  @RequirePermissions('menu.manage')
+  removePrizeImage(@CurrentScope() scope: Scope, @Param('id', ParseUUIDPipe) id: string) {
+    return this.surprise.removePrizeImage(scope, id);
   }
 
   @Post('redemptions/:id/validate')
@@ -224,9 +342,14 @@ export class LoyaltyStaffController {
 @ApiHeader({ name: SESSION_HEADER, required: true })
 @Controller({ path: 'guest/loyalty', version: '1' })
 export class LoyaltyGuestController {
-  constructor(private readonly loyalty: LoyaltyService) {}
+  constructor(
+    private readonly loyalty: LoyaltyService,
+    private readonly surprise: SurpriseService,
+  ) {}
 
+  /** Spec 046, R7 : lisible aussi depuis « Réglé · Merci », pour fêter le cadeau débloqué au règlement. */
   @Get()
+  @AllowSettledSession()
   card(@CurrentGuest() guest: GuestSession) {
     return this.loyalty.card(guest);
   }
@@ -244,7 +367,30 @@ export class LoyaltyGuestController {
   redeem(@CurrentGuest() guest: GuestSession) {
     return this.loyalty.redeem(guest);
   }
+
+  @Post('gifts/:id/reveal')
+  @HttpCode(200)
+  @AllowSettledSession()
+  @ApiOperation({ summary: 'Spec 046, R9 : déballer un cadeau' })
+  async reveal(@CurrentGuest() guest: GuestSession, @Param('id', ParseUUIDPipe) id: string) {
+    return this.surprise.reveal(guest, await this.loyalty.sessionCard(guest), id);
+  }
+
+  @Post('gifts/:id/celebrated')
+  @HttpCode(204)
+  @AllowSettledSession()
+  @ApiOperation({ summary: 'Spec 046, R7 : les feux d’artifice ont été joués' })
+  async celebrated(@CurrentGuest() guest: GuestSession, @Param('id', ParseUUIDPipe) id: string): Promise<void> {
+    await this.surprise.celebrated(guest, await this.loyalty.sessionCard(guest), id);
+  }
+
+  @Post('gifts/:id/use')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Spec 046, R10 : utiliser un cadeau (un par visite)' })
+  async use(@CurrentGuest() guest: GuestSession, @Param('id', ParseUUIDPipe) id: string) {
+    return this.surprise.use(guest, await this.loyalty.sessionCard(guest), id);
+  }
 }
 
-@Module({ imports: [ServiceRequestsModule, RealtimeModule], controllers: [LoyaltyStaffController, LoyaltyGuestController], providers: [LoyaltyService] })
+@Module({ imports: [ServiceRequestsModule, RealtimeModule], controllers: [LoyaltyStaffController, LoyaltyGuestController], providers: [LoyaltyService, SurpriseService] })
 export class LoyaltyModule {}

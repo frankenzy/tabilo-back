@@ -20,7 +20,7 @@ const MIME_EXT: Record<string, string> = { 'image/jpeg': 'jpg', 'image/png': 'pn
  * Restent : le compte anonymisé et ses paiements d'abonnement (comptabilité de l'éditeur), le journal de la plateforme.
  */
 const ERASE_ORDER = [
-  'LoyaltyStamp', 'LoyaltyRedemption', 'LoyaltyCard', 'LoyaltyProgram',
+  'LoyaltyGift', 'LoyaltyPrizeDraw', 'LoyaltyPrize', 'LoyaltyStamp', 'LoyaltyRedemption', 'LoyaltyCard', 'LoyaltyProgram',
   'ServiceRequestEvent', 'ServiceRequestItemOffer', 'ServiceRequestItem', 'ServiceAssignment', 'Notification', 'UnpaidAlert', 'OutboxEvent',
   'ServiceRequest', 'TableSession', 'QrCode', 'EscalationRule', 'DiningTable', 'RequestType', 'DiningArea',
   'MenuOption', 'MenuOptionGroup', 'MenuBundleGroup', 'MenuItem', 'MenuCategory', 'Membership',
