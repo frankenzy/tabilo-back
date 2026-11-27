@@ -161,10 +161,11 @@ describe('Demandes : parcours client, cycle de vie, concurrence, escalade', () =
       expect((await act(waiter1, id, 'resolve').expect(200)).body.status).toBe('resolved');
 
       const detail = await t.http.get(`${owner.base}/requests/${id}`).set(owner.auth).expect(200);
+      // Spec 048 (CA-048-03) : l'historique, l'action la plus récente d'abord.
       expect(detail.body.events.map((e: { type: string }) => e.type)).toEqual([
-        'request.created', 'request.assigned', 'request.accepted', 'request.started', 'request.resolved',
+        'request.resolved', 'request.started', 'request.accepted', 'request.assigned', 'request.created',
       ]);
-      expect(detail.body.events[0].actorType).toBe('customer');
+      expect(detail.body.events.at(-1).actorType).toBe('customer');
       expect(detail.body.events[2].actorName).toBe('Koffi Test');
       const row = await t.prisma.serviceRequest.findUniqueOrThrow({ where: { id } });
       expect(row.assignedAt && row.acceptedAt && row.startedAt && row.resolvedAt).toBeTruthy();

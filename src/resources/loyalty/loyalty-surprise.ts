@@ -261,7 +261,7 @@ export class SurpriseService {
   async pending(scope: Scope) {
     const gifts = await this.prisma.loyaltyGift.findMany({
       where: { establishmentId: scope.establishmentId, tenantId: scope.tenantId, requestedAt: { not: null }, usedAt: null },
-      orderBy: { requestedAt: 'asc' },
+      orderBy: { requestedAt: 'desc' },
     });
     const prizes = await this.prizesById(gifts.map((gift) => gift.prizeId));
     return gifts.map((gift) => {

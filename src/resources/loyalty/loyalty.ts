@@ -136,7 +136,7 @@ export class LoyaltyService {
   async pending(scope: Scope) {
     const rows = await this.prisma.loyaltyRedemption.findMany({
       where: { establishmentId: scope.establishmentId, tenantId: scope.tenantId, validatedAt: null },
-      orderBy: { createdAt: 'asc' },
+      orderBy: { createdAt: 'desc' },
     });
     const items = new Map(
       (await this.prisma.menuItem.findMany({ where: { id: { in: rows.map((row) => row.rewardItemId) } }, select: { id: true, name: true, imageId: true } })).map((item) => [item.id, item]),
@@ -304,7 +304,7 @@ export class LoyaltyStaffController {
   @ApiOperation({ summary: 'Spec 043, R4 et spec 046, R10 : récompenses et cadeaux à valider' })
   async pending(@CurrentScope() scope: Scope) {
     const [rewards, gifts] = await Promise.all([this.loyalty.pending(scope), this.surprise.pending(scope)]);
-    return [...rewards.map((row) => ({ ...row, kind: 'reward' as const })), ...gifts].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return [...rewards.map((row) => ({ ...row, kind: 'reward' as const })), ...gifts].sort((a, b) => b.createdAt.localeCompare(a.createdAt)); // Spec 048 : le plus récent d'abord.
   }
 
   @Post('gifts/:id/validate')

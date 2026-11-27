@@ -151,7 +151,8 @@ export class ServiceRequestsService {
       this.prisma.serviceRequest.findMany({
         where,
         include: REQUEST_INCLUDE,
-        orderBy: { createdAt: (query.scope === 'active' || query.scope === 'unpaid') && !query.status ? 'asc' : 'desc' },
+        // Spec 048, R1 : le plus récent d'abord, pour toutes les listes (actives et à régler comprises).
+        orderBy: { createdAt: 'desc' },
         ...skipTake(query),
       }),
       this.prisma.serviceRequest.count({ where }),
@@ -174,7 +175,9 @@ export class ServiceRequestsService {
     const [view] = await this.withBills([request]);
     return {
       ...view,
-      events: request.events.map((event) => ({
+      // Spec 048 : l'historique, l'action la plus récente d'abord. Lu dans l'ordre d'écriture puis retourné :
+      // deux actions d'une même transaction ont la même heure, leur ordre reste exact.
+      events: [...request.events].reverse().map((event) => ({
         id: event.id,
         type: event.type,
         fromStatus: event.fromStatus,
