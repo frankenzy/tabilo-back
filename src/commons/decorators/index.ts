@@ -5,6 +5,13 @@ import type { AppRequest, AuthUser, GuestSession, Scope } from '../types';
 export const IS_PUBLIC = 'tabilo:isPublic';
 export const REQUIRED_PERMISSIONS = 'tabilo:permissions';
 export const ALLOW_SUSPENDED = 'tabilo:allowSuspended';
+export const ALLOW_SETTLED_SESSION = 'tabilo:allowSettledSession';
+
+/**
+ * Spec 046, R7 : route du parcours client encore ouverte à une session réglée (écran « Réglé · Merci » :
+ * lire sa carte, fêter et déballer un cadeau). Rien qui commande ou utilise.
+ */
+export const AllowSettledSession = () => SetMetadata(ALLOW_SETTLED_SESSION, true);
 
 /** Spec 035, R6 : route encore ouverte quand le compte est suspendu (page « Abonnement »). */
 export const AllowSuspended = () => SetMetadata(ALLOW_SUSPENDED, true);

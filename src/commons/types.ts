@@ -28,6 +28,8 @@ export interface GuestSession {
   tableId: string;
   /** Spec 027, R2 : repère de la session. */
   markerIndex: number;
+  /** Spec 046, R7 : session réglée, admise seulement sur les routes `@AllowSettledSession()`. */
+  settled?: boolean;
 }
 
 export interface AppRequest extends FastifyRequest {

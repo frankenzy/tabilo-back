@@ -838,6 +838,8 @@ model MenuImage {
   category          MenuCategory?
   /// Spec 031 : logo d'un établissement.
   establishmentLogo Establishment? @relation("EstablishmentLogo")
+  /// Spec 046 : image d'un lot du panier de cadeaux.
+  loyaltyPrize      LoyaltyPrize?
 
   @@index([establishmentId])
 }
@@ -892,14 +894,97 @@ model UnpaidAlert {
 
 /// Spec 043, R1 : carte de fidélité d'un établissement (une au plus).
 model LoyaltyProgram {
-  id              String   @id @default(uuid()) @db.Uuid
-  tenantId        String   @db.Uuid
-  establishmentId String   @unique @db.Uuid
-  stampsRequired  Int
-  minOrderMinor   Int      @default(0)
-  rewardItemId    String   @db.Uuid
-  isActive        Boolean  @default(true)
-  updatedAt       DateTime @updatedAt @db.Timestamptz(3)
+  id               String      @id @default(uuid()) @db.Uuid
+  tenantId         String      @db.Uuid
+  establishmentId  String      @unique @db.Uuid
+  /// Spec 046, R1 : Classique (spec 043) ou Surprise.
+  mode             LoyaltyMode @default(classic)
+  stampsRequired   Int         @default(10)
+  minOrderMinor    Int         @default(0)
+  /// Récompense du mode Classique ; facultative en mode Surprise.
+  rewardItemId     String?     @db.Uuid
+  /// Spec 046, R4 : un cadeau toutes les `surpriseMin` à `surpriseMax` commandes.
+  surpriseMin      Int         @default(2)
+  surpriseMax      Int         @default(5)
+  /// Spec 046, R11 : validité d'un cadeau, en jours après son déblocage.
+  giftValidityDays Int         @default(30)
+  isActive         Boolean     @default(true)
+  updatedAt        DateTime    @updatedAt @db.Timestamptz(3)
+}
+
+enum LoyaltyMode {
+  classic
+  surprise
+}
+
+enum LoyaltyPrizeKind {
+  /// Un plat de la carte, offert par le geste de la spec 033.
+  menu_item
+  /// Un lot libre (bonbons, bon pour un jus…), remis à la main.
+  free
+}
+
+/// Spec 046, R2 : un lot du panier de cadeaux. Retiré, il est archivé : les cadeaux tirés le gardent.
+model LoyaltyPrize {
+  id              String           @id @default(uuid()) @db.Uuid
+  tenantId        String           @db.Uuid
+  establishmentId String           @db.Uuid
+  kind            LoyaltyPrizeKind
+  menuItemId      String?          @db.Uuid
+  name            String
+  imageId         String?          @unique @db.Uuid
+  /// Chance d'être tiré, de 1 à 100 (proportion du total des lots disponibles).
+  weight          Int
+  /// Spec 046, R6 : stock mensuel ; null = sans limite.
+  monthlyStock    Int?
+  position        Int              @default(0)
+  archivedAt      DateTime?        @db.Timestamptz(3)
+  createdAt       DateTime         @default(now()) @db.Timestamptz(3)
+
+  image MenuImage? @relation(fields: [imageId], references: [id], onDelete: SetNull)
+
+  @@index([establishmentId, archivedAt])
+}
+
+/// Spec 046, R6 : nombre de tirages d'un lot dans un mois (« 2026-11 »).
+model LoyaltyPrizeDraw {
+  id              String @id @default(uuid()) @db.Uuid
+  tenantId        String @db.Uuid
+  establishmentId String @db.Uuid
+  prizeId         String @db.Uuid
+  month           String
+  count           Int    @default(0)
+
+  @@unique([prizeId, month])
+  @@index([establishmentId])
+}
+
+/// Spec 046 : un cadeau débloqué au règlement, emballé jusqu'à ce que le client le déballe.
+model LoyaltyGift {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @db.Uuid
+  establishmentId String    @db.Uuid
+  cardId          String    @db.Uuid
+  prizeId         String    @db.Uuid
+  /// Session dont le règlement l'a débloqué : un déblocage par règlement.
+  unlockSessionId String    @unique @db.Uuid
+  /// Nombre de tampons de la carte au déblocage (place du cadeau sur la vague).
+  atStamp         Int
+  unlockedAt      DateTime  @default(now()) @db.Timestamptz(3)
+  expiresAt       DateTime  @db.Timestamptz(3)
+  revealedAt      DateTime? @db.Timestamptz(3)
+  celebratedAt    DateTime? @db.Timestamptz(3)
+  /// Spec 046, R10 : session où il est utilisé ; un cadeau par session.
+  useSessionId    String?   @unique @db.Uuid
+  tableId         String?   @db.Uuid
+  requestedAt     DateTime? @db.Timestamptz(3)
+  usedAt          DateTime? @db.Timestamptz(3)
+  usedById        String?   @db.Uuid
+  /// Commande offerte créée à la validation d'un plat de la carte.
+  requestId       String?   @db.Uuid
+
+  @@index([cardId])
+  @@index([establishmentId, requestedAt])
 }
 
 /// Spec 043, R2 : carte d'un client, identifiée par un jeton aléatoire gardé dans son téléphone (haché ici).
@@ -910,6 +995,8 @@ model LoyaltyCard {
   tokenHash       String   @unique
   stamps          Int      @default(0)
   rewardsRedeemed Int      @default(0)
+  /// Spec 046, R5 : tampons qui débloquent le prochain cadeau ; tiré par le serveur, jamais envoyé au téléphone.
+  nextGiftAt      Int?
   createdAt       DateTime @default(now()) @db.Timestamptz(3)
 
   @@index([establishmentId])
