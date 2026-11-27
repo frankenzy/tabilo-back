@@ -51,7 +51,8 @@ describe('Spec 046 — cadeaux surprises', () => {
     /** Une session ouverte, carte présentée, sans commande. */
     const sit = async (): Promise<Guest> => {
       const guest = await openSession(t, table.code);
-      await t.http.post('/api/v1/guest/loyalty/attach').set(guest.headers).send({ token: cardToken }).expect(200);
+      const attached = (await t.http.post('/api/v1/guest/loyalty/attach').set(guest.headers).send(cardToken ? { token: cardToken } : {}).expect(200)).body;
+      cardToken ??= attached.token;
       return guest;
     };
     const card = async (guest: Guest) => (await t.http.get('/api/v1/guest/loyalty').set(guest.headers).expect(200)).body;
@@ -77,7 +78,7 @@ describe('Spec 046 — cadeaux surprises', () => {
     await prize({ kind: 'free', weight: 10 }, 400);
   });
 
-  it('CA-046-02, CA-046-03 et CA-046-05 — déblocage au règlement qui atteint le seuil, rien de secret au téléphone, lisible depuis « Réglé · Merci »', async () => {
+  it('CA-046-02, CA-046-03 et CA-046-05 — déblocage au règlement qui atteint le seuil, contenu secret, lisible depuis « Réglé · Merci »', async () => {
     const { prize, program, visit, card } = await shop('Surprise déblocage');
     await prize({ kind: 'free', name: 'Bonbons secrets', weight: 10 });
     await program({ mode: 'surprise', surpriseMin: 2, surpriseMax: 2 });
@@ -93,7 +94,8 @@ describe('Spec 046 — cadeaux surprises', () => {
     expect(afterTwo.surprise.gifts[0]).toMatchObject({ state: 'wrapped', revealed: false, atStamp: 2, celebrate: true, prize: null });
     const raw = JSON.stringify(afterTwo);
     expect(raw).not.toContain('Bonbons secrets');
-    expect(raw).not.toContain('nextGiftAt');
+    // R5 révisée : on sait quand (prochain cadeau à 4 tampons), pas quoi.
+    expect(afterTwo.surprise).toMatchObject({ nextAt: 4, remaining: 2 });
     // Commander reste interdit à une session réglée.
     await t.http.post('/api/v1/guest/orders').set(second.headers).send({ items: [] }).expect(401);
 
@@ -209,6 +211,35 @@ describe('Spec 046 — cadeaux surprises', () => {
     // Le mode Surprise refuse la récompense classique.
     const guest = await sit();
     expect((await t.http.post('/api/v1/guest/loyalty/redeem').set(guest.headers).send({}).expect(422)).body.code).toBe('LOYALTY_MODE');
+  });
+
+  it('CA-046-13 — on sait quand : seuil tiré dès la carte, commandes restantes', async () => {
+    const { prize, program, visit, sit, card } = await shop('Surprise quand');
+    await prize({ kind: 'free', name: 'Bonbons', weight: 10 });
+    await program({ mode: 'surprise', surpriseMin: 3, surpriseMax: 3 });
+    // Carte neuve, avant toute commande.
+    expect((await card(await sit())).surprise).toMatchObject({ nextAt: 3, remaining: 3, giftsReceived: 0 });
+    const first = await visit();
+    expect((await card(first)).surprise).toMatchObject({ nextAt: 3, remaining: 2 });
+    await visit();
+    const third = await visit();
+    expect((await card(third)).surprise).toMatchObject({ giftsReceived: 1, nextAt: 6, remaining: 3 });
+    expect((await card(await sit())).surprise.remaining).toBe(3);
+  });
+
+  it('CA-046-14 — une visite sous le minimum ne donne pas de tampon, et le téléphone le sait', async () => {
+    const { program, card, coca, garba, owner, table, visit } = await shop('Surprise pas de tampon');
+    await program({ stampsRequired: 5, rewardItemId: garba });
+    const act = (id: string, action: string) => t.http.post(`${owner.base}/requests/${id}/${action}`).set(owner.auth).send({}).expect(200);
+    const small = await openSession(t, table.code);
+    await t.http.post('/api/v1/guest/loyalty/attach').set(small.headers).send({}).expect(200);
+    const id = (await t.http.post('/api/v1/guest/orders').set(small.headers).send({ items: [{ menuItemId: coca, quantity: 1 }] }).expect(200)).body.request.id as string;
+    await act(id, 'prepare');
+    await act(id, 'resolve');
+    await act(id, 'settle');
+    expect(await card(small)).toMatchObject({ visitStamped: false, minOrderMinor: 2000, stamps: 0 });
+    const big = await visit();
+    expect((await card(big)).visitStamped).toBe(true);
   });
 
   it('CA-046-12 — un compte Essentiel ne passe pas en mode Surprise', async () => {

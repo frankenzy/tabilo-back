@@ -77,6 +77,10 @@ export interface GuestGiftView {
 export interface SurpriseCardView {
   giftsReceived: number;
   gifts: GuestGiftView[];
+  /** R5 (révisée) : nombre de tampons qui débloque le prochain cadeau — on sait quand, pas quoi. */
+  nextAt: number;
+  /** Commandes comptées restantes avant le prochain cadeau (au moins 1). */
+  remaining: number;
 }
 
 /** Spec 046 : panier de cadeaux, cadeaux du client, déballage et utilisation. */
@@ -196,7 +200,7 @@ export class SurpriseService {
   // ---------------------------------------------------------------- client
 
   /** R5, R8 et R9 : les cadeaux de la carte ; le lot d'un cadeau emballé n'est jamais envoyé. */
-  async cardView(cardId: string): Promise<SurpriseCardView> {
+  async cardView(cardId: string): Promise<Omit<SurpriseCardView, 'nextAt' | 'remaining'>> {
     const gifts = await this.prisma.loyaltyGift.findMany({ where: { cardId }, orderBy: { unlockedAt: 'desc' }, take: 100 });
     const now = new Date();
     const prizes = await this.prizesById(gifts.filter((gift) => gift.revealedAt).map((gift) => gift.prizeId));
