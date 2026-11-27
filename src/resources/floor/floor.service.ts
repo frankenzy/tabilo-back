@@ -278,7 +278,8 @@ export class FloorService {
     const sessionIds = [...new Set([...sessions.map((session) => session.id), ...requests.map((request) => request.sessionId).filter((id): id is string => !!id)])];
     const sessionRows = await this.prisma.tableSession.findMany({
       where: { id: { in: sessionIds }, ...this.where(scope) },
-      orderBy: { openedAt: 'asc' },
+      // Spec 048, R1 : le client arrivé en dernier d'abord.
+      orderBy: { openedAt: 'desc' },
       select: { id: true, markerIndex: true, status: true },
     });
     const images = new Map(

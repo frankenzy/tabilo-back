@@ -82,7 +82,8 @@ export class UnpaidAlertsService {
   async list(scope: Scope): Promise<UnpaidAlertView[]> {
     const alerts = await this.prisma.unpaidAlert.findMany({
       where: { tenantId: scope.tenantId, establishmentId: scope.establishmentId, resolvedAt: null },
-      orderBy: { createdAt: 'asc' },
+      // Spec 048, R1 : la plus récente d'abord.
+      orderBy: { createdAt: 'desc' },
       include: { session: { select: { markerIndex: true, lastActivityAt: true, table: { select: { id: true, label: true } } } } },
     });
     return alerts.map((alert) => ({
