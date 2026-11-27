@@ -14,6 +14,7 @@ import { RealtimeModule } from '../realtime/realtime.module';
 import { ServiceRequestsModule } from '../service-requests/service-requests.module';
 import { ServiceRequestsService, staffActor } from '../service-requests/service-requests.service';
 import { MenuImageDto } from '../menu/menu.controller';
+import { drawThreshold } from './loyalty-draw';
 import { CreatePrizeDto, SurpriseService, UpdatePrizeDto, type SurpriseCardView } from './loyalty-surprise';
 
 /** Spec 043, R1 et spec 046, R1 : la carte de fidélité de l'établissement, en mode Classique ou Surprise. */
@@ -59,8 +60,10 @@ export interface GuestCardView {
   stampsRequired: number;
   minOrderMinor: number;
   rewardItemId: string | null;
-  /** Spec 046 : cadeaux du mode Surprise (le prochain seuil n'est jamais envoyé). */
+  /** Spec 046 : cadeaux du mode Surprise, avec la place du prochain (R5 révisée) ; jamais le lot d'un cadeau emballé. */
   surprise: SurpriseCardView | null;
+  /** Spec 046, R16 : la visite (session) a-t-elle donné un tampon ? */
+  visitStamped: boolean;
   /** Récompense demandée pendant cette visite, en attente ou validée. */
   redemption: { id: string; validated: boolean } | null;
 }
@@ -231,21 +234,46 @@ export class LoyaltyService {
   private async view(
     guest: GuestSession,
     cardId: string,
-    program: { mode: 'classic' | 'surprise'; stampsRequired: number; minOrderMinor: number; rewardItemId: string | null },
+    program: {
+      mode: 'classic' | 'surprise';
+      stampsRequired: number;
+      minOrderMinor: number;
+      rewardItemId: string | null;
+      surpriseMin: number;
+      surpriseMax: number;
+    },
   ): Promise<GuestCardView> {
-    const [card, redemption] = await Promise.all([
-      this.prisma.loyaltyCard.findUniqueOrThrow({ where: { id: cardId }, select: { stamps: true } }),
+    const [card, redemption, stamp] = await Promise.all([
+      this.prisma.loyaltyCard.findUniqueOrThrow({ where: { id: cardId }, select: { stamps: true, nextGiftAt: true } }),
       this.prisma.loyaltyRedemption.findUnique({ where: { sessionId: guest.id }, select: { id: true, validatedAt: true } }),
+      this.prisma.loyaltyStamp.findUnique({ where: { sessionId: guest.id }, select: { id: true } }),
     ]);
+    let surprise: SurpriseCardView | null = null;
+    if (program.mode === 'surprise') {
+      const nextAt = card.nextGiftAt ?? (await this.drawFirstThreshold(cardId, card.stamps, program));
+      surprise = { ...(await this.surprise.cardView(cardId)), nextAt, remaining: Math.max(1, nextAt - card.stamps) };
+    }
     return {
       mode: program.mode,
       stamps: card.stamps,
       stampsRequired: program.stampsRequired,
       minOrderMinor: program.minOrderMinor,
       rewardItemId: program.rewardItemId,
-      surprise: program.mode === 'surprise' ? await this.surprise.cardView(cardId) : null,
+      surprise,
+      visitStamped: stamp !== null,
       redemption: redemption ? { id: redemption.id, validated: redemption.validatedAt !== null } : null,
     };
+  }
+
+  /**
+   * Spec 046, R5 (révisée) : le premier seuil est tiré dès que la carte existe en mode Surprise.
+   * Q10 : les tampons en cours comptent ; s'ils dépassent déjà le seuil, la prochaine commande comptée débloque.
+   */
+  private async drawFirstThreshold(cardId: string, stamps: number, program: { surpriseMin: number; surpriseMax: number }): Promise<number> {
+    const drawn = Math.max(drawThreshold(program.surpriseMin, program.surpriseMax), stamps + 1);
+    await this.prisma.loyaltyCard.updateMany({ where: { id: cardId, nextGiftAt: null }, data: { nextGiftAt: drawn } });
+    // Deux lectures simultanées : la première écriture gagne.
+    return (await this.prisma.loyaltyCard.findUniqueOrThrow({ where: { id: cardId }, select: { nextGiftAt: true } })).nextGiftAt ?? drawn;
   }
 }
 
