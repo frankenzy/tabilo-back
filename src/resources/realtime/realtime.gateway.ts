@@ -96,6 +96,13 @@ export class RealtimeGateway implements OnGatewayInit, OnModuleInit {
 
   private async broadcast(event: DomainEvent, tx: Parameters<ServiceRequestsService['loadForBroadcast']>[0]) {
     if (!this.server) return;
+    if (event.type === 'session.left') {
+      // Spec 047, R6 : « Table 2 · client parti » ; la vue « Tables » se relit.
+      this.server
+        .to(staffRoom(event.establishmentId))
+        .emit('session.changed', { eventId: event.eventId, type: event.type, tableLabel: event.tableLabel ?? null, tableFree: event.tableFree ?? false });
+      return;
+    }
     if (event.type === 'session.closed' || event.type === 'session.settled') {
       for (const sessionId of event.sessionIds ?? []) {
         // Spec 027, R4 : « session.settled » fait afficher « Réglé · Merci » au téléphone.

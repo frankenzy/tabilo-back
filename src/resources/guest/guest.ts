@@ -9,13 +9,15 @@ import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize, ArrayMinSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { CurrentGuest, Public } from '../../commons/decorators';
+import { AllowSettledSession, CurrentGuest, Public } from '../../commons/decorators';
 import { GuestSessionGuard, SESSION_HEADER } from '../../commons/guards/guest-session.guard';
 import { PrismaService } from '../../commons/prisma/prisma.service';
 import type { GuestSession } from '../../commons/types';
 import { hashToken, randomToken } from '../../commons/utils/crypto';
 import { freeMarker } from '../../commons/utils/zone';
-import { forbidden, notFound, tooMany, unprocessable } from '../../commons/utils/errors';
+import { conflict, forbidden, notFound, tooMany, unprocessable } from '../../commons/utils/errors';
+import { AuditService } from '../../commons/services/audit.service';
+import { OutboxService } from '../outbox/outbox.service';
 import { MenuModule } from '../menu/menu.module';
 import { MenuService } from '../menu/menu.service';
 import { RealtimeModule } from '../realtime/realtime.module';
@@ -119,7 +121,33 @@ export class GuestService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly menu: MenuService,
+    private readonly audit: AuditService,
+    private readonly outbox: OutboxService,
   ) {}
+
+  /**
+   * Spec 047, R5 à R7 : le client réglé libère la table. Seule sa session est concernée ; le personnel
+   * est prévenu (« client parti », et « table libre » si plus aucune session n'y est ouverte).
+   * Une seconde demande ne renvoie pas d'événement.
+   */
+  async leave(guest: GuestSession): Promise<{ left: true; tableFree: boolean }> {
+    if (!guest.settled) throw conflict('SESSION_NOT_SETTLED', 'Réglez d’abord votre note.');
+    const result = await this.prisma.$transaction(async (tx) => {
+      const table = await tx.diningTable.findUniqueOrThrow({ where: { id: guest.tableId }, select: { label: true } });
+      const open = await tx.tableSession.count({ where: { tableId: guest.tableId, status: 'open', expiresAt: { gt: new Date() } } });
+      const tableFree = open === 0;
+      const already = await tx.auditLog.findFirst({ where: { action: 'session.left', entityType: 'TableSession', entityId: guest.id }, select: { id: true } });
+      if (already) return { tableFree, fresh: false };
+      await this.audit.record(
+        { action: 'session.left', tenantId: guest.tenantId, establishmentId: guest.establishmentId, entityType: 'TableSession', entityId: guest.id, metadata: { tableId: guest.tableId, tableFree } },
+        tx,
+      );
+      await this.outbox.add(tx, guest, 'session.left', { sessionIds: [guest.id], tableLabel: table.label, tableFree });
+      return { tableFree, fresh: true };
+    });
+    if (result.fresh) this.outbox.kick();
+    return { left: true, tableFree: result.tableFree };
+  }
 
   /**
    * Ouvre une session de table à partir du QR. Le jeton renvoyé n'existe en clair que chez
@@ -274,6 +302,16 @@ export class GuestController {
   @ApiOperation({ summary: 'Contexte de la session : établissement, table, types de demande' })
   context(@CurrentGuest() guest: GuestSession) {
     return this.guests.context(guest);
+  }
+
+  @Post('session/leave')
+  @HttpCode(200)
+  @UseGuards(GuestSessionGuard)
+  @AllowSettledSession()
+  @ApiHeader({ name: SESSION_HEADER, required: true })
+  @ApiOperation({ summary: 'Spec 047 : le client réglé libère la table (le personnel est prévenu)' })
+  leave(@CurrentGuest() guest: GuestSession) {
+    return this.guests.leave(guest);
   }
 
   @Get('requests')
