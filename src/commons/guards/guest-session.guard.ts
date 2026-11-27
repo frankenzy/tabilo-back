@@ -2,7 +2,7 @@ import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import type { AppRequest, GuestSession } from '../types';
 import { hashToken } from '../utils/crypto';
-import { unauthorized } from '../utils/errors';
+import { forbidden, unauthorized } from '../utils/errors';
 
 export const SESSION_HEADER = 'x-table-session';
 
@@ -13,17 +13,23 @@ export class GuestSessionResolver {
 
   async resolve(token: unknown): Promise<GuestSession | null> {
     const result = await this.inspect(token);
-    return result === 'settled' || result === null ? null : result;
+    return result === 'settled' || result === 'suspended' || result === null ? null : result;
   }
 
   /** Comme `resolve`, mais distingue une session réglée (spec 027, R4) d'une session invalide. */
-  async inspect(token: unknown): Promise<GuestSession | 'settled' | null> {
+  async inspect(token: unknown): Promise<GuestSession | 'settled' | 'suspended' | null> {
     if (typeof token !== 'string' || token.length < 32 || token.length > 128) return null;
     const session = await this.prisma.tableSession.findUnique({
       where: { tokenHash: hashToken(token) },
-      select: { id: true, tenantId: true, establishmentId: true, tableId: true, status: true, expiresAt: true, markerIndex: true },
+      select: {
+        id: true, tenantId: true, establishmentId: true, tableId: true, status: true, expiresAt: true, markerIndex: true,
+        establishment: { select: { tenant: { select: { accountState: true, status: true } } } },
+      },
     });
     if (!session) return null;
+    // Spec 035, R6 : compte suspendu, le téléphone affiche l'écran d'indisponibilité.
+    // Spec 041, R4 : un compte fermé aussi.
+    if (session.establishment.tenant.accountState === 'suspended' || session.establishment.tenant.status !== 'active') return 'suspended';
     if (session.status === 'settled') return 'settled';
     if (session.status !== 'open' || session.expiresAt <= new Date()) return null;
     return {
@@ -50,6 +56,9 @@ export class GuestSessionGuard implements CanActivate {
     if (guest === 'settled') {
       // Spec 027, R4 : le téléphone affiche « Réglé · Merci » et propose une nouvelle session.
       throw unauthorized('TABLE_SESSION_SETTLED', 'Votre note est réglée. Merci !');
+    }
+    if (guest === 'suspended') {
+      throw forbidden('ACCOUNT_SUSPENDED', 'Service momentanément indisponible.');
     }
     if (!guest) {
       throw unauthorized('TABLE_SESSION_INVALID', 'Session de table expirée. Scannez à nouveau le QR code.');

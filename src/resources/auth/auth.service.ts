@@ -2,6 +2,9 @@ import { effectivePermissions } from '../../commons/constants/permissions';
 import { Inject, Injectable } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as argon2 from 'argon2';
+import type { AccountState, PlanKey } from '@prisma/client';
+import { LEGAL_VERSION } from '../../commons/constants/legal';
+import { GRACE_DAYS, PLANS, TABILO_WHATSAPP, TRIAL_DAYS, type PlanFeature } from '../../commons/constants/plans';
 import { randomUUID } from 'node:crypto';
 import { APP_ENV, AppEnv } from '../../commons/config/env';
 import type { AccessTokenPayload } from '../../commons/guards/access.guard';
@@ -35,8 +38,20 @@ export interface MeView {
   lastName: string;
   mustChangePassword: boolean;
   tenant: { id: string; name: string };
+  /** Spec 034 et 035 : abonnement du compte. */
+  account: {
+    plan: PlanKey;
+    planName: string;
+    state: AccountState;
+    paidUntil: string;
+    graceUntil: string;
+    features: PlanFeature[];
+    contact: string;
+    termsVersion: string | null;
+    legalVersion: string;
+  };
   memberships: {
-    establishment: { id: string; name: string; timezone: string };
+    establishment: { id: string; name: string; timezone: string; logoImageId: string | null };
     role: { key: string; name: string };
     permissions: string[];
   }[];
@@ -67,7 +82,14 @@ export class AuthService {
     const passwordHash = await hashPassword(dto.password);
 
     const user = await this.prisma.$transaction(async (tx) => {
-      const tenant = await tx.tenant.create({ data: { name: dto.organizationName } });
+      // Spec 035, R2 : essai de 7 jours en formule Pro.
+      const tenant = await tx.tenant.create({
+        data: {
+          name: dto.organizationName, plan: 'pro', accountState: 'trial', paidUntil: new Date(Date.now() + TRIAL_DAYS * 86_400_000),
+          // Spec 041, R2 : version acceptée à l'inscription.
+          termsVersion: LEGAL_VERSION, termsAcceptedAt: new Date(),
+        },
+      });
       const establishment = await tx.establishment.create({
         data: { tenantId: tenant.id, name: dto.establishmentName, timezone: dto.timezone ?? 'Africa/Abidjan' },
       });
@@ -192,11 +214,12 @@ export class AuthService {
     const row = await this.prisma.user.findUniqueOrThrow({
       where: { id: user.id },
       include: {
-        tenant: { select: { id: true, name: true } },
+        tenant: { select: { id: true, name: true, plan: true, accountState: true, paidUntil: true, termsVersion: true } },
         memberships: {
           where: { establishment: { archivedAt: null } },
           include: {
-            establishment: { select: { id: true, name: true, timezone: true } },
+            // Spec 031, R8 : le logo s'affiche dans le sélecteur d'établissement.
+            establishment: { select: { id: true, name: true, timezone: true, logoImageId: true } },
             role: { select: { key: true, name: true, permissions: true } },
           },
           orderBy: { createdAt: 'asc' },
@@ -209,7 +232,20 @@ export class AuthService {
       firstName: row.firstName,
       lastName: row.lastName,
       mustChangePassword: row.mustChangePassword,
-      tenant: row.tenant,
+      tenant: { id: row.tenant.id, name: row.tenant.name },
+      // Spec 034 et 035 : formule, état et échéance, pour les cadenas et les bandeaux.
+      account: {
+        plan: row.tenant.plan,
+        planName: PLANS[row.tenant.plan].name,
+        state: row.tenant.accountState,
+        paidUntil: row.tenant.paidUntil.toISOString(),
+        graceUntil: new Date(row.tenant.paidUntil.getTime() + GRACE_DAYS * 86_400_000).toISOString(),
+        features: PLANS[row.tenant.plan].features,
+        contact: TABILO_WHATSAPP,
+        // Spec 041, R2 : une nouvelle version s'affiche au propriétaire, qui l'accepte pour continuer.
+        termsVersion: row.tenant.termsVersion,
+        legalVersion: LEGAL_VERSION,
+      },
       memberships: row.memberships.map((m) => ({
         establishment: m.establishment,
         role: { key: m.role.key, name: m.role.name },
@@ -217,6 +253,27 @@ export class AuthService {
         permissions: effectivePermissions(m.role.permissions, m.revokedPermissions),
       })),
     };
+  }
+
+  /** Spec 036, R5 : un lien valable 24 heures, une seule fois ; toutes les sessions du propriétaire tombent. */
+  async resetPassword(dto: { token: string; password: string }, client: ClientContext): Promise<void> {
+    const row = await this.prisma.passwordResetToken.findUnique({ where: { tokenHash: hashToken(dto.token) } });
+    if (!row || row.usedAt || row.expiresAt <= new Date()) {
+      throw unprocessable('RESET_LINK_INVALID', 'Ce lien n’est plus valable. Demandez-en un nouveau à TABILO.');
+    }
+    const passwordHash = await hashPassword(dto.password);
+    const user = await this.prisma.$transaction(async (tx) => {
+      const used = await tx.passwordResetToken.updateMany({ where: { id: row.id, usedAt: null }, data: { usedAt: new Date() } });
+      if (used.count !== 1) throw unprocessable('RESET_LINK_INVALID', 'Ce lien n’est plus valable. Demandez-en un nouveau à TABILO.');
+      const updated = await tx.user.update({
+        where: { id: row.userId },
+        data: { passwordHash, mustChangePassword: false, failedLoginCount: 0, lockedUntil: null },
+        select: { id: true, tenantId: true },
+      });
+      await tx.refreshSession.updateMany({ where: { userId: row.userId, revokedAt: null }, data: { revokedAt: new Date() } });
+      return updated;
+    });
+    await this.audit.recordSafely({ action: 'auth.password_reset', tenantId: user.tenantId, actorId: user.id, ip: client.ip });
   }
 
   /** Changer son mot de passe révoque toutes les sessions, puis en ouvre une nouvelle. */

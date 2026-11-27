@@ -15,7 +15,7 @@ import { PrismaService } from '../../commons/prisma/prisma.service';
 import type { GuestSession } from '../../commons/types';
 import { hashToken, randomToken } from '../../commons/utils/crypto';
 import { freeMarker } from '../../commons/utils/zone';
-import { notFound, tooMany, unprocessable } from '../../commons/utils/errors';
+import { forbidden, notFound, tooMany, unprocessable } from '../../commons/utils/errors';
 import { MenuModule } from '../menu/menu.module';
 import { MenuService } from '../menu/menu.service';
 import { RealtimeModule } from '../realtime/realtime.module';
@@ -48,12 +48,29 @@ export class GuestCreateRequestDto {
   quantity?: number;
 }
 
+/** Spec 032 : le plat choisi dans une rubrique de formule. */
+export class BundleChoiceDto {
+  @ApiProperty() @IsUUID()
+  groupId: string;
+
+  @ApiProperty() @IsUUID()
+  menuItemId: string;
+}
+
 export class OrderLineDto {
   @ApiProperty() @IsUUID()
   menuItemId: string;
 
   @ApiProperty({ minimum: 1, maximum: 20 }) @IsInt() @Min(1) @Max(20)
   quantity: number;
+
+  @ApiPropertyOptional({ type: [String], description: 'Spec 038 : options choisies (identifiants)' })
+  @IsOptional() @IsArray() @ArrayMaxSize(40) @IsUUID('all', { each: true })
+  options?: string[];
+
+  @ApiPropertyOptional({ type: [BundleChoiceDto], description: 'Spec 032 : un choix par rubrique, pour une formule seulement' })
+  @IsOptional() @IsArray() @ArrayMaxSize(4) @ValidateNested({ each: true }) @Type(() => BundleChoiceDto)
+  choices?: BundleChoiceDto[];
 }
 
 /** Spec 027, R8 : position du téléphone au moment de commander. Utilisée pour le calcul, jamais conservée. */
@@ -114,14 +131,17 @@ export class GuestService {
       where: { code },
       include: {
         table: { select: { id: true, archivedAt: true } },
-        establishment: { select: { sessionTtlMinutes: true, archivedAt: true, tenant: { select: { status: true } } } },
+        establishment: { select: { sessionTtlMinutes: true, archivedAt: true, tenant: { select: { status: true, accountState: true } } } },
       },
     });
     if (
-      !qr || qr.status !== 'active' || qr.table.archivedAt || qr.establishment.archivedAt ||
-      qr.establishment.tenant.status !== 'active'
+      !qr || qr.status !== 'active' || qr.table.archivedAt || qr.establishment.archivedAt
     ) {
       throw notFound('QR_INVALID', "Ce QR code n'est plus valide. Adressez-vous au personnel.");
+    }
+    // Spec 035, R6 : compte suspendu ; spec 041, R4 : compte fermé — écran d'indisponibilité.
+    if (qr.establishment.tenant.accountState === 'suspended' || qr.establishment.tenant.status !== 'active') {
+      throw forbidden('ACCOUNT_SUSPENDED', 'Service momentanément indisponible.');
     }
     const recent = await this.prisma.tableSession.count({
       where: { tableId: qr.tableId, openedAt: { gt: new Date(Date.now() - SESSION_WINDOW_MS) } },
@@ -170,7 +190,10 @@ export class GuestService {
     const [establishment, table, types, menu] = await Promise.all([
       this.prisma.establishment.findUniqueOrThrow({
         where: { id: guest.establishmentId },
-        select: { name: true, currency: true, pairingsEnabled: true, zoneLatitude: true, zoneLongitude: true },
+        select: {
+          name: true, currency: true, pairingsEnabled: true, zoneLatitude: true, zoneLongitude: true, serviceMode: true,
+          logoImageId: true, brandColor: true, welcomeText: true, timezone: true,
+        },
       }),
       this.prisma.diningTable.findUniqueOrThrow({
         where: { id: guest.tableId },
@@ -183,9 +206,33 @@ export class GuestService {
       }),
       this.menu.overview(guest.establishmentId),
     ]);
-    const categories = menu.filter((category) => category.items.length > 0);
+    // Spec 032, R4 : une formule dont une rubrique n'a plus de plat disponible est en rupture.
+    const available = new Set(menu.flatMap((category) => category.items).filter((item) => !item.isBundle && item.isAvailable).map((item) => item.id));
+    const categories = menu
+      .map((category) => ({
+        ...category,
+        items: category.items.map((item) =>
+          item.isBundle
+            ? { ...item, isAvailable: item.isAvailable && item.groups.every((group) => group.choiceIds.some((id) => available.has(id))) }
+            : // Spec 038, R6 : un groupe obligatoire sans option disponible met le plat en rupture.
+              { ...item, isAvailable: item.isAvailable && item.optionGroups.every((group) => !group.required || group.options.some((option) => option.isAvailable)) },
+        ),
+      }))
+      .filter((category) => category.items.length > 0);
     return {
-      establishment: { name: establishment.name, currency: establishment.currency },
+      // Spec 031 : l'apparence de l'établissement, dès le premier affichage.
+      establishment: {
+        // Spec 043, R2 : la carte de fidélité est rangée, dans le téléphone, sous une clé propre à l'établissement,
+        // dérivée de son identifiant sans le révéler.
+        key: hashToken(`loyalty:${guest.establishmentId}`).slice(0, 16),
+        name: establishment.name,
+        currency: establishment.currency,
+        logoImageId: establishment.logoImageId,
+        brandColor: establishment.brandColor,
+        welcomeText: establishment.welcomeText,
+        // Spec 039 : les créneaux s'affichent à l'heure de l'établissement.
+        timezone: establishment.timezone,
+      },
       table: { label: table.label, area: table.area.name },
       // Spec 028 : « L'addition » reste parmi les demandes proposées ; `kind` la distingue côté téléphone.
       requestTypes: types.filter((type) => type.kind !== 'order'),
@@ -198,6 +245,8 @@ export class GuestService {
       marker: guest.markerIndex,
       // Spec 027, R8 : une zone existe, le téléphone demandera sa position au moment de commander.
       zone: establishment.zoneLatitude !== null && establishment.zoneLongitude !== null,
+      // Spec 030 : le téléphone adapte l'addition et le suivi à la façon de servir.
+      serviceMode: establishment.serviceMode,
     };
   }
 }

@@ -460,7 +460,8 @@ describe('Spec 001 — carte et commandes', () => {
       const res = await t.http.get('/api/v1/guest/requests').set(guest.headers).expect(200);
       const seen = (res.body as Record<string, unknown>[]).find((r) => r.id === placed.body.request.id)!;
       expect(seen).toMatchObject({ totalMinor: 1000, items: [{ name: 'Bissap client', quantity: 2, unitPriceMinor: 500 }], handledBy: 'Awa' });
-      expect(seen).not.toHaveProperty('note');
+      // Spec 029, R5 : seule une demande « Message » rend son texte au téléphone ; une commande, jamais.
+      expect((seen as { note?: unknown }).note ?? null).toBeNull();
       expect(JSON.stringify(seen)).not.toContain('Koné');
     });
   });

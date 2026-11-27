@@ -4,6 +4,10 @@ import type { AppRequest, AuthUser, GuestSession, Scope } from '../types';
 
 export const IS_PUBLIC = 'tabilo:isPublic';
 export const REQUIRED_PERMISSIONS = 'tabilo:permissions';
+export const ALLOW_SUSPENDED = 'tabilo:allowSuspended';
+
+/** Spec 035, R6 : route encore ouverte quand le compte est suspendu (page « Abonnement »). */
+export const AllowSuspended = () => SetMetadata(ALLOW_SUSPENDED, true);
 
 /** Route accessible sans jeton du personnel (auth, parcours client, santé). */
 export const Public = () => SetMetadata(IS_PUBLIC, true);

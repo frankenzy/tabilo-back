@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { isPermissionKey, PERMISSIONS, PermissionKey, SYSTEM_ROLES } from '../../commons/constants/permissions';
 import { PrismaService } from '../../commons/prisma/prisma.service';
+import { PlanService } from '../../commons/services/plan.service';
 import { AuditService } from '../../commons/services/audit.service';
 import type { Scope } from '../../commons/types';
 import { conflict, forbidden, notFound, unprocessable } from '../../commons/utils/errors';
@@ -21,6 +22,7 @@ export class RolesService implements OnModuleInit {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly plans: PlanService,
   ) {}
 
   /** Aligne les rôles système sur la matrice du code à chaque démarrage (idempotent). */
@@ -55,6 +57,8 @@ export class RolesService implements OnModuleInit {
   }
 
   async create(scope: Scope, dto: { name: string; permissions: string[] }): Promise<RoleView> {
+    // Spec 034, R4 : rôles personnalisés réservés aux formules qui les comprennent.
+    await this.plans.assertFeature(scope.tenantId, 'custom_roles');
     const permissions = this.sanitize(scope, dto.permissions);
     const key = `custom-${dto.name.toLowerCase().normalize('NFD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`;
     const duplicate = await this.prisma.role.findFirst({ where: { tenantId: scope.tenantId, key } });

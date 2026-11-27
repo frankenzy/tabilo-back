@@ -3,7 +3,7 @@ import { Reflector } from '@nestjs/core';
 import { JwtService } from '@nestjs/jwt';
 import { isUUID } from 'class-validator';
 import { effectivePermissions, PermissionKey } from '../constants/permissions';
-import { IS_PUBLIC, REQUIRED_PERMISSIONS } from '../decorators';
+import { ALLOW_SUSPENDED, IS_PUBLIC, REQUIRED_PERMISSIONS } from '../decorators';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../services/audit.service';
 import type { AppRequest } from '../types';
@@ -47,13 +47,15 @@ export class AccessGuard implements CanActivate {
         id: true,
         tenantId: true,
         status: true,
-        tenant: { select: { status: true } },
+        tenant: { select: { status: true, accountState: true } },
       },
     });
     if (!user || user.status !== 'active' || user.tenant.status !== 'active' || user.tenantId !== payload.tid) {
       throw unauthorized('SESSION_INVALID', 'Session invalide. Reconnectez-vous.');
     }
     request.user = { id: user.id, tenantId: user.tenantId };
+    // Spec 035, R6 : compte suspendu — seules la page « Abonnement » et les routes hors établissement restent ouvertes.
+    const suspended = user.tenant.accountState === 'suspended';
 
     const required = this.reflector.getAllAndOverride<PermissionKey[]>(REQUIRED_PERMISSIONS, targets) ?? [];
     if (establishmentId === undefined) {
@@ -71,6 +73,9 @@ export class AccessGuard implements CanActivate {
       : null;
     if (!membership) {
       throw notFound('ESTABLISHMENT_NOT_FOUND', 'Établissement introuvable.');
+    }
+    if (suspended && !this.reflector.getAllAndOverride<boolean>(ALLOW_SUSPENDED, targets)) {
+      throw forbidden('ACCOUNT_SUSPENDED', 'Votre abonnement est suspendu. Ouvrez la page « Abonnement » pour le réactiver.');
     }
     // Spec 010 : permissions effectives (rôle moins retraits propres à l'employé).
     const permissions = new Set(effectivePermissions(membership.role.permissions, membership.revokedPermissions));

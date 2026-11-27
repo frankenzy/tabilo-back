@@ -27,7 +27,7 @@ describe('Sécurité : authentification, isolation inter-tenant, permissions', (
 
     it('refuse une adresse e-mail déjà utilisée', async () => {
       const res = await t.http.post('/api/v1/auth/register').send({
-        organizationName: 'Copie', establishmentName: 'Copie', firstName: 'A', lastName: 'B', email: a.email, password: PASSWORD,
+        organizationName: 'Copie', establishmentName: 'Copie', firstName: 'A', lastName: 'B', email: a.email, password: PASSWORD, acceptTerms: true,
       });
       expect(res.status).toBe(409);
     });
@@ -261,7 +261,8 @@ describe('Sécurité : authentification, isolation inter-tenant, permissions', (
       const guestView = received.guest[1].request;
       expect(guestView.handledBy).toBe('Awa');
       expect(guestView).not.toHaveProperty('assignee');
-      expect(guestView).not.toHaveProperty('note');
+      // Spec 029, R5 : la note d'une demande de service ou d'une commande n'est pas rendue au téléphone.
+      expect((guestView as { note?: unknown }).note ?? null).toBeNull();
     });
   });
 });

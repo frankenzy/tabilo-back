@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { effectivePermissions, isPermissionKey } from '../../commons/constants/permissions';
 import { PrismaService, Tx } from '../../commons/prisma/prisma.service';
+import { PlanService } from '../../commons/services/plan.service';
 import { AuditService } from '../../commons/services/audit.service';
 import type { Scope } from '../../commons/types';
 import { conflict, forbidden, notFound, unprocessable } from '../../commons/utils/errors';
@@ -47,6 +48,7 @@ export class StaffService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly plans: PlanService,
   ) {}
 
   async list(scope: Scope): Promise<StaffView[]> {
@@ -63,6 +65,8 @@ export class StaffService {
    * Le membre doit le changer à sa première connexion (mustChangePassword).
    */
   async create(scope: Scope, dto: CreateStaffInput): Promise<StaffView> {
+    // Spec 034, R3 : équipe de l'établissement dans la limite de la formule.
+    await this.plans.assertLimit(scope.tenantId, 'staffPerEstablishment', scope.establishmentId);
     const role = await this.assignableRole(scope, dto.roleId);
     const taken = await this.prisma.user.findUnique({ where: { email: dto.email }, select: { id: true } });
     if (taken) throw conflict('EMAIL_TAKEN', 'Un compte existe déjà avec cette adresse e-mail.');
@@ -139,6 +143,9 @@ export class StaffService {
    */
   async setPermissions(scope: Scope, userId: string, wanted: string[]): Promise<StaffView> {
     const membership = await this.find(scope, userId);
+    // Spec 034, R4 : retirer une permission à un employé fait partie des rôles personnalisés.
+    const restores = wanted.length >= membership.role.permissions.filter(isPermissionKey).length;
+    if (!restores) await this.plans.assertFeature(scope.tenantId, 'custom_roles');
     if (userId === scope.userId) {
       throw unprocessable('SELF_CHANGE_FORBIDDEN', 'Vous ne pouvez pas ajuster vos propres permissions.');
     }

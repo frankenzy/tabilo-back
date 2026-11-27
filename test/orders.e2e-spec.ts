@@ -144,7 +144,8 @@ describe('Spec 007 — écran Commandes', () => {
 
   it('CA-007-02 — « Préparer » refuse une demande qui n’est pas une commande', async () => {
     const guest = await openSession(t, code);
-    const res = await t.http.post('/api/v1/guest/requests').set(guest.headers).send({ requestTypeId: guest.typeIds[0] }).expect(200);
+    // Spec 029 : l'appel (typeIds[0]) se prend aussi par « J'y vais » ; « De l'eau » reste une simple demande de service.
+    const res = await t.http.post('/api/v1/guest/requests').set(guest.headers).send({ requestTypeId: guest.typeIds[1] }).expect(200);
     const refused = await act(koffi, res.body.request.id as string, 'prepare').expect(422);
     expect(refused.body.code).toBe('NOT_AN_ORDER');
   });

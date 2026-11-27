@@ -162,7 +162,11 @@ describe('Spec 028 — l’addition', () => {
     const r3 = (await askBill(walked).expect(200)).body.request.id as string;
     await t.prisma.tableSession.update({ where: { id: await sessionOf(walked) }, data: { lastActivityAt: new Date(Date.now() - 60 * 60_000) } });
     await t.app.get(UnpaidAlertsService).sweep();
-    const alert = (await t.http.get(`${owner.base}/unpaid-alerts`).set(owner.auth).expect(200)).body[0] as { id: string };
+    // Spec 027, R10 : les sessions libérée et expirée ont aussi levé une alerte ; on traite celle du client parti.
+    const walkedId = await sessionOf(walked);
+    const alert = ((await t.http.get(`${owner.base}/unpaid-alerts`).set(owner.auth).expect(200)).body as { id: string; sessionId: string }[]).find(
+      (candidate) => candidate.sessionId === walkedId,
+    )!;
     await t.http.post(`${owner.base}/unpaid-alerts/${alert.id}/resolve`).set(owner.auth).send({ resolution: 'walked_out' }).expect(200);
     expect((await view(r3)).status).toBe('cancelled');
     expect(await reason(r3)).toEqual({ billClosedBy: 'walked_out' });

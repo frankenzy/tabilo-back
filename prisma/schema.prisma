@@ -60,7 +60,19 @@ enum UnpaidAlertResolution {
   walked_out
 }
 
+/// Spec 030, R1 : façon de servir d'un établissement, figée sur chaque commande (R2).
+enum ServiceMode {
+  /// Servir puis régler (maquis, par défaut).
+  serve_then_pay
+  /// Régler quand on veut : addition et règlement possibles avant le service.
+  pay_anytime
+  /// Régler à la caisse d'abord : la commande attend l'encaissement avant la préparation.
+  pay_first
+}
+
 enum RequestStatus {
+  /// Spec 030, R6 : commande à encaisser avant la préparation (« Caisse d'abord »).
+  awaiting_payment
   pending
   assigned
   accepted
@@ -113,51 +125,191 @@ enum EscalationTrigger {
 
 /// Client de la plateforme (société exploitante). Racine de l'isolation des données.
 model Tenant {
-  id        String       @id @default(uuid()) @db.Uuid
-  name      String
-  status    TenantStatus @default(active)
-  createdAt DateTime     @default(now()) @db.Timestamptz(3)
-  updatedAt DateTime     @updatedAt @db.Timestamptz(3)
+  id                String       @id @default(uuid()) @db.Uuid
+  name              String
+  status            TenantStatus @default(active)
+  /// Spec 034 : formule d'abonnement.
+  plan              PlanKey      @default(pro)
+  /// Spec 035, R1 : essai, actif, en retard, suspendu. Distinct de `status` (blocage technique).
+  accountState      AccountState @default(trial)
+  /// Spec 035 : échéance (fin d'essai ou fin de la période payée).
+  paidUntil         DateTime     @default(now()) @db.Timestamptz(3)
+  /// Spec 036, R4 : suspension décidée par l'éditeur ; la tâche quotidienne ne la lève pas.
+  manuallySuspended Boolean      @default(false)
+  /// Spec 041, R2 : version des conditions et de la politique acceptée par le propriétaire.
+  termsVersion      String?
+  termsAcceptedAt   DateTime?    @db.Timestamptz(3)
+  /// Spec 041, R3 : dernier export des données (un par heure au plus).
+  lastExportAt      DateTime?    @db.Timestamptz(3)
+  /// Spec 041, R4 et R5 : compte fermé par l'éditeur, effacé après `deleteAfter` ; `erasedAt` une fois effacé.
+  closedAt          DateTime?    @db.Timestamptz(3)
+  closeReason       String?
+  deleteAfter       DateTime?    @db.Timestamptz(3)
+  erasedAt          DateTime?    @db.Timestamptz(3)
+  createdAt         DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime     @updatedAt @db.Timestamptz(3)
 
   establishments Establishment[]
   users          User[]
   roles          Role[]
+  payments       SubscriptionPayment[]
+}
+
+/// Spec 034, R1 : formules d'abonnement (catalogue dans commons/constants/plans.ts).
+enum PlanKey {
+  essentiel
+  pro
+  premium
+}
+
+/// Spec 035, R1.
+enum AccountState {
+  trial
+  active
+  past_due
+  suspended
+}
+
+/// Spec 037, R1 : moyens de paiement de l'abonnement.
+enum PaymentMethod {
+  cash
+  orange_money
+  mtn_momo
+  moov_money
+  wave
+  bank_transfer
+}
+
+/// Spec 037 : paiement d'abonnement enregistré par l'éditeur, et son reçu (jamais supprimé, R5).
+model SubscriptionPayment {
+  id                String        @id @default(uuid()) @db.Uuid
+  tenantId          String        @db.Uuid
+  /// Numéro de reçu `AAAA-NNNN`, sans trou par année (R4).
+  number            String        @unique
+  amountMinor       Int
+  method            PaymentMethod
+  reference         String?
+  months            Int
+  plan              PlanKey
+  /// Période couverte.
+  periodStart       DateTime      @db.Timestamptz(3)
+  periodEnd         DateTime      @db.Timestamptz(3)
+  /// Échéance avant ce paiement : rétablie si le paiement est annulé (R5).
+  previousPaidUntil DateTime      @db.Timestamptz(3)
+  createdById       String        @db.Uuid
+  createdAt         DateTime      @default(now()) @db.Timestamptz(3)
+  cancelledAt       DateTime?     @db.Timestamptz(3)
+  cancelReason      String?
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, createdAt])
+}
+
+/// Spec 037, R4 : compteur de reçus par année, verrouillé à chaque numéro.
+model ReceiptCounter {
+  year Int @id
+  last Int @default(0)
+}
+
+/// Spec 036, R1 : compte de l'éditeur, hors de tout compte client.
+model PlatformAdmin {
+  id               String    @id @default(uuid()) @db.Uuid
+  email            String    @unique
+  name             String
+  passwordHash     String
+  failedLoginCount Int       @default(0)
+  lockedUntil      DateTime? @db.Timestamptz(3)
+  lastLoginAt      DateTime? @db.Timestamptz(3)
+  createdAt        DateTime  @default(now()) @db.Timestamptz(3)
+
+  sessions PlatformSession[]
+}
+
+/// Spec 036, R7 : session de la console (jeton opaque en cookie HttpOnly, haché en base), 8 heures.
+model PlatformSession {
+  id        String    @id @default(uuid()) @db.Uuid
+  adminId   String    @db.Uuid
+  tokenHash String    @unique
+  expiresAt DateTime  @db.Timestamptz(3)
+  revokedAt DateTime? @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+
+  admin PlatformAdmin @relation(fields: [adminId], references: [id], onDelete: Cascade)
+}
+
+/// Spec 036, R6 : journal de la plateforme, ni modifiable ni effaçable depuis l'application.
+model PlatformAuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  adminId   String   @db.Uuid
+  tenantId  String?  @db.Uuid
+  action    String
+  reason    String?
+  before    Json?
+  after     Json?
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([tenantId, createdAt])
+}
+
+/// Spec 036, R5 : lien de réinitialisation du mot de passe, à usage unique, 24 heures.
+model PasswordResetToken {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @db.Uuid
+  tokenHash   String    @unique
+  expiresAt   DateTime  @db.Timestamptz(3)
+  usedAt      DateTime? @db.Timestamptz(3)
+  createdById String    @db.Uuid
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([userId])
 }
 
 /// Point de vente (restaurant, café, glacier). Porte le paramétrage opérationnel.
 model Establishment {
-  id                        String    @id @default(uuid()) @db.Uuid
-  tenantId                  String    @db.Uuid
+  id                        String      @id @default(uuid()) @db.Uuid
+  tenantId                  String      @db.Uuid
   name                      String
-  timezone                  String    @default("Africa/Abidjan")
+  timezone                  String      @default("Africa/Abidjan")
   /// Devise des prix de la carte (code ISO 4217).
-  currency                  String    @default("XOF")
+  currency                  String      @default("XOF")
   address                   String?
   phone                     String?
   /// Durée de validité d'une session de table après un scan.
-  sessionTtlMinutes         Int       @default(180)
+  sessionTtlMinutes         Int         @default(180)
   /// Nombre maximal de demandes non terminées par table.
-  maxActiveRequestsPerTable Int       @default(5)
+  maxActiveRequestsPerTable Int         @default(5)
   /// Nombre maximal de demandes créées par une même session.
-  maxRequestsPerSession     Int       @default(30)
+  maxRequestsPerSession     Int         @default(30)
   /// Délai minimal entre deux demandes d'une même session.
-  requestCooldownSeconds    Int       @default(10)
+  requestCooldownSeconds    Int         @default(10)
   /// Spec 007 : une cuisine séparée signale les commandes prêtes au serveur (étape « Prête »).
-  separateKitchen           Boolean   @default(false)
+  separateKitchen           Boolean     @default(false)
   /// Spec 012, R7 : rangée « Souvent pris avec » dans la fiche d'un plat (désactivée par défaut).
-  pairingsEnabled           Boolean   @default(false)
+  pairingsEnabled           Boolean     @default(false)
   /// Spec 027, R8 et R12 : centre de la zone de l'établissement (NULL = pas de zone, aucune position demandée).
   zoneLatitude              Float?
   zoneLongitude             Float?
   /// Rayon de la zone, en mètres (50 à 500).
-  zoneRadiusM               Int       @default(150)
+  zoneRadiusM               Int         @default(150)
   /// Délai sans activité avant l'alerte de départ sans payer, en minutes (10 à 60).
-  unpaidAlertMinutes        Int       @default(20)
-  createdAt                 DateTime  @default(now()) @db.Timestamptz(3)
-  updatedAt                 DateTime  @updatedAt @db.Timestamptz(3)
-  archivedAt                DateTime? @db.Timestamptz(3)
+  unpaidAlertMinutes        Int         @default(20)
+  /// Spec 030, R1 : façon de servir.
+  serviceMode               ServiceMode @default(serve_then_pay)
+  /// Spec 030, R9 : une commande envoyée part directement en préparation (sans effet en pay_first).
+  autoStartOrders           Boolean     @default(false)
+  /// Spec 031, R1 : logo (image carrée, servie comme une photo de plat).
+  logoImageId               String?     @unique @db.Uuid
+  /// Spec 031, R2 : couleur principale, clé de la palette fermée (establishments/branding.ts).
+  brandColor                String      @default("orange")
+  /// Spec 031, R6 : mot d'accueil facultatif, 80 caractères au plus.
+  welcomeText               String?
+  createdAt                 DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt                 DateTime    @updatedAt @db.Timestamptz(3)
+  archivedAt                DateTime?   @db.Timestamptz(3)
 
   tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  logo            MenuImage?       @relation("EstablishmentLogo", fields: [logoImageId], references: [id], onDelete: SetNull)
   memberships     Membership[]
   areas           DiningArea[]
   tables          DiningTable[]
@@ -308,6 +460,8 @@ model QrCode {
   status          QrStatus  @default(active)
   createdAt       DateTime  @default(now()) @db.Timestamptz(3)
   revokedAt       DateTime? @db.Timestamptz(3)
+  /// Spec 042, R5 : dernière impression de ce QR ; NULL = jamais imprimé (nouvelle table ou QR régénéré).
+  printedAt       DateTime? @db.Timestamptz(3)
 
   establishment Establishment  @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
   table         DiningTable    @relation(fields: [tableId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
@@ -338,6 +492,8 @@ model TableSession {
   lastActivityAt    DateTime      @default(now()) @db.Timestamptz(3)
   /// Spec 027, R9 : « Client encore là » — pas de nouvelle alerte avant cette heure.
   alertSnoozedUntil DateTime?     @db.Timestamptz(3)
+  /// Spec 043, R2 : carte de fidélité présentée par ce téléphone (sans compte).
+  loyaltyCardId     String?       @db.Uuid
 
   establishment Establishment    @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
   table         DiningTable      @relation(fields: [tableId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
@@ -420,6 +576,8 @@ model ServiceRequest {
   /// Spec 027, R9 : « Parti sans payer ». La commande sort du reste à encaisser.
   writtenOffAt     DateTime?        @db.Timestamptz(3)
   writtenOffById   String?          @db.Uuid
+  /// Spec 030, R2 : façon de servir figée à l'envoi d'une commande ; NULL = demande de service ou commande antérieure (servir puis régler).
+  serviceMode      ServiceMode?
 
   establishment Establishment         @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
   table         DiningTable           @relation(fields: [tableId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
@@ -577,28 +735,93 @@ model MenuCategory {
 /// Article de la carte. Le prix est un entier en unité mineure de la devise de l'établissement
 /// (1 500 F CFA = 1500 ; 8,50 € = 850) : jamais de nombre à virgule pour de l'argent.
 model MenuItem {
-  id              String    @id @default(uuid()) @db.Uuid
-  tenantId        String    @db.Uuid
-  establishmentId String    @db.Uuid
-  categoryId      String    @db.Uuid
-  name            String
-  description     String?
-  priceMinor      Int
-  imageId         String?   @unique @db.Uuid
+  id                String    @id @default(uuid()) @db.Uuid
+  tenantId          String    @db.Uuid
+  establishmentId   String    @db.Uuid
+  categoryId        String    @db.Uuid
+  name              String
+  description       String?
+  priceMinor        Int
+  imageId           String?   @unique @db.Uuid
   /// false = en rupture : affiché, mais non commandable.
-  isAvailable     Boolean   @default(true)
-  position        Int       @default(0)
-  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
-  updatedAt       DateTime  @updatedAt @db.Timestamptz(3)
-  archivedAt      DateTime? @db.Timestamptz(3)
+  isAvailable       Boolean   @default(true)
+  /// Spec 032 : formule (pack) à prix unique, composée d'un choix par rubrique (MenuBundleGroup).
+  isBundle          Boolean   @default(false)
+  /// Spec 033, R1 : prix promotionnel, strictement inférieur au prix ; NULL = pas de promotion.
+  promoPriceMinor   Int?
+  /// Spec 039, R2 : créneaux de la promotion — [{ days: [1..7], start: "HH:MM", end: "HH:MM" }] ; NULL = permanente.
+  promoSlots        Json?
+  /// Spec 039, Q1 : nom de la promotion programmée (« Happy hour » par défaut à l'affichage).
+  promoName         String?
+  /// Spec 039, R3 : créneaux de disponibilité ; NULL = toujours disponible.
+  availabilitySlots Json?
+  position          Int       @default(0)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime  @updatedAt @db.Timestamptz(3)
+  archivedAt        DateTime? @db.Timestamptz(3)
 
-  establishment Establishment @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
-  category      MenuCategory  @relation(fields: [categoryId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
-  image         MenuImage?    @relation(fields: [imageId], references: [id], onDelete: SetNull)
+  establishment Establishment     @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  category      MenuCategory      @relation(fields: [categoryId, establishmentId], references: [id, establishmentId], onDelete: Restrict)
+  image         MenuImage?        @relation(fields: [imageId], references: [id], onDelete: SetNull)
+  bundleGroups  MenuBundleGroup[]
+  optionGroups  MenuOptionGroup[]
 
   @@unique([id, establishmentId])
   @@index([establishmentId, archivedAt])
   @@index([categoryId])
+}
+
+/// Spec 038, R1 : groupe d'options d'un plat (taille, accompagnement, suppléments).
+model MenuOptionGroup {
+  id              String  @id @default(uuid()) @db.Uuid
+  tenantId        String  @db.Uuid
+  establishmentId String  @db.Uuid
+  itemId          String  @db.Uuid
+  name            String
+  /// Plusieurs choix possibles (sinon un seul).
+  multiple        Boolean @default(false)
+  required        Boolean @default(false)
+  position        Int
+
+  item    MenuItem     @relation(fields: [itemId, establishmentId], references: [id, establishmentId], onDelete: Cascade)
+  options MenuOption[]
+
+  @@index([itemId])
+}
+
+/// Spec 038, R1 : une option et son supplément (0 ou plus).
+model MenuOption {
+  id              String  @id @default(uuid()) @db.Uuid
+  tenantId        String  @db.Uuid
+  establishmentId String  @db.Uuid
+  groupId         String  @db.Uuid
+  name            String
+  priceMinor      Int     @default(0)
+  /// Pictogramme facultatif (mêmes clés que les rubriques).
+  icon            String?
+  /// Spec 038, R6 : option indisponible, grisée.
+  isAvailable     Boolean @default(true)
+  position        Int
+
+  group MenuOptionGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@index([groupId])
+}
+
+/// Spec 032, R1 : rubrique d'une formule (« Plat », « Boisson »…) et les plats proposés, dans l'ordre.
+/// Les plats sont contrôlés à l'écriture (même établissement, plats simples) ; un plat archivé disparaît à la lecture (R7).
+model MenuBundleGroup {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  establishmentId String   @db.Uuid
+  bundleId        String   @db.Uuid
+  name            String
+  position        Int
+  choiceIds       String[] @db.Uuid
+
+  bundle MenuItem @relation(fields: [bundleId, establishmentId], references: [id, establishmentId], onDelete: Cascade)
+
+  @@index([bundleId])
 }
 
 /// Photo d'un article, stockée en base (image réduite par le navigateur avant envoi).
@@ -611,8 +834,10 @@ model MenuImage {
   data            Bytes
   createdAt       DateTime @default(now()) @db.Timestamptz(3)
 
-  item     MenuItem?
-  category MenuCategory?
+  item              MenuItem?
+  category          MenuCategory?
+  /// Spec 031 : logo d'un établissement.
+  establishmentLogo Establishment? @relation("EstablishmentLogo")
 
   @@index([establishmentId])
 }
@@ -620,14 +845,22 @@ model MenuImage {
 /// Ligne d'une commande. Nom et prix sont figés à la commande : modifier la carte ensuite
 /// ne réécrit pas l'historique.
 model ServiceRequestItem {
-  id              String @id @default(uuid()) @db.Uuid
-  tenantId        String @db.Uuid
-  establishmentId String @db.Uuid
-  requestId       String @db.Uuid
-  menuItemId      String @db.Uuid
+  id              String                   @id @default(uuid()) @db.Uuid
+  tenantId        String                   @db.Uuid
+  establishmentId String                   @db.Uuid
+  requestId       String                   @db.Uuid
+  menuItemId      String                   @db.Uuid
   name            String
   unitPriceMinor  Int
   quantity        Int
+  /// Spec 032, R5 : choix d'une formule, figés à la commande — [{ group, menuItemId, name }]. NULL pour un plat.
+  choices         Json?
+  /// Spec 038, R5 : options choisies, figées — [{ group, optionId, name, priceMinor }]. NULL sans option.
+  options         Json?
+  /// Spec 033, R1 et R7 : prix de la carte quand la ligne a été commandée en promotion (unitPriceMinor = prix promo).
+  listPriceMinor  Int?
+  /// Spec 033, R4 : ligne offerte (table à part : la ligne elle-même reste figée, append-only).
+  offer           ServiceRequestItemOffer?
 
   request ServiceRequest @relation(fields: [requestId], references: [id], onDelete: Restrict)
 
@@ -655,4 +888,75 @@ model UnpaidAlert {
 
   @@index([establishmentId, resolvedAt])
   @@index([sessionId])
+}
+
+/// Spec 043, R1 : carte de fidélité d'un établissement (une au plus).
+model LoyaltyProgram {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  establishmentId String   @unique @db.Uuid
+  stampsRequired  Int
+  minOrderMinor   Int      @default(0)
+  rewardItemId    String   @db.Uuid
+  isActive        Boolean  @default(true)
+  updatedAt       DateTime @updatedAt @db.Timestamptz(3)
+}
+
+/// Spec 043, R2 : carte d'un client, identifiée par un jeton aléatoire gardé dans son téléphone (haché ici).
+model LoyaltyCard {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  establishmentId String   @db.Uuid
+  tokenHash       String   @unique
+  stamps          Int      @default(0)
+  rewardsRedeemed Int      @default(0)
+  createdAt       DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([establishmentId])
+}
+
+/// Spec 043, R3 et R5 : un tampon par visite (session) au plus.
+model LoyaltyStamp {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  establishmentId String   @db.Uuid
+  cardId          String   @db.Uuid
+  sessionId       String   @unique @db.Uuid
+  createdAt       DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([cardId])
+}
+
+/// Spec 043, R4 et R5 : récompense demandée par le client, validée par un serveur ; une par visite au plus.
+model LoyaltyRedemption {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @db.Uuid
+  establishmentId String    @db.Uuid
+  cardId          String    @db.Uuid
+  sessionId       String    @unique @db.Uuid
+  tableId         String    @db.Uuid
+  rewardItemId    String    @db.Uuid
+  /// Commande offerte créée à la validation.
+  requestId       String?   @db.Uuid
+  validatedAt     DateTime? @db.Timestamptz(3)
+  validatedById   String?   @db.Uuid
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([establishmentId, validatedAt])
+}
+
+/// Spec 033, R4 et R5 : une ligne offerte. La ligne de commande reste figée (append-only, spec 001) :
+/// offrir ajoute cette entrée, retirer le cadeau la supprime. La ligne vaut alors 0 dans le total de la commande.
+model ServiceRequestItemOffer {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  establishmentId String   @db.Uuid
+  requestId       String   @db.Uuid
+  itemId          String   @unique @db.Uuid
+  offeredById     String?  @db.Uuid
+  createdAt       DateTime @default(now()) @db.Timestamptz(3)
+
+  item ServiceRequestItem @relation(fields: [itemId], references: [id], onDelete: Restrict)
+
+  @@index([requestId])
 }

@@ -4,6 +4,7 @@ import { APP_ENV, AppEnv, loadEnv } from './config/env';
 import { PrismaService } from './prisma/prisma.service';
 import { RedisService } from './redis/redis.service';
 import { AuditService } from './services/audit.service';
+import { PlanService } from './services/plan.service';
 
 /** Briques transverses : configuration validée, base de données, Redis, JWT, audit. */
 @Global()
@@ -25,7 +26,8 @@ import { AuditService } from './services/audit.service';
     PrismaService,
     RedisService,
     AuditService,
+    PlanService,
   ],
-  exports: [APP_ENV, PrismaService, RedisService, AuditService, JwtModule],
+  exports: [APP_ENV, PrismaService, RedisService, AuditService, PlanService, JwtModule],
 })
 export class CommonsModule {}

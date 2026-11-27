@@ -61,6 +61,8 @@ export async function registerTenant(t: TestApp, name = 'Maquis'): Promise<Accou
       lastName: 'Koné',
       email,
       password: PASSWORD,
+      // Spec 041, R2.
+      acceptTerms: true,
     })
     .expect(201);
   const account = await toAccount(t, res.body.accessToken, email);
